@@ -73,12 +73,32 @@ const orderSchema = new mongoose.Schema(
   {
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     planName: { type: String, required: true },
+    vpsId: { type: String },
+    ram: { type: String },
     price: { type: Number, required: true },
     status: { type: String, default: "pending" },
   },
   { timestamps: true }
 );
 const Order = mongoose.model("Order", orderSchema);
+
+const vpsPlanSchema = new mongoose.Schema(
+  {
+    vpsId: { type: String, required: true, unique: true }, // jaise "vps-46"
+    nameOrIp: { type: String, required: true }, // jaise "103.109.18.x"
+    label: { type: String }, // jaise "Windows Server | Delhi DC"
+    company: { type: String, default: "Manual Delivery" }, // delivery type
+    ramOptions: [
+      {
+        ram: { type: String, required: true }, // jaise "16 GB"
+        price: { type: Number, required: true },
+      },
+    ],
+    available: { type: Boolean, default: true },
+  },
+  { timestamps: true }
+);
+const VpsPlan = mongoose.model("VpsPlan", vpsPlanSchema);
 
 // ==================== MIDDLEWARE (auth check) ====================
 const protect = (req, res, next) => {
@@ -197,32 +217,38 @@ app.post("/api/auth/login", async (req, res) => {
 
 // ==================== VPS ROUTES ====================
 
-const plans = [
-  { id: 1, name: "Starter VPS", ram: "2GB RAM", cpu: "1 vCPU", storage: "40GB SSD", bandwidth: "1TB", price: 299 },
-  { id: 2, name: "Business VPS", ram: "4GB RAM", cpu: "2 vCPU", storage: "80GB SSD", bandwidth: "2TB", price: 599 },
-  { id: 3, name: "Pro VPS", ram: "8GB RAM", cpu: "4 vCPU", storage: "160GB SSD", bandwidth: "4TB", price: 1199 },
-  { id: 4, name: "Enterprise VPS", ram: "16GB RAM", cpu: "8 vCPU", storage: "320GB SSD", bandwidth: "8TB", price: 2399 },
-];
-
 // ---------- PLANS LIST (public, login ki zarurat nahi) ----------
-app.get("/api/vps/plans", (req, res) => {
-  res.json(plans);
+app.get("/api/vps/plans", async (req, res) => {
+  try {
+    const plans = await VpsPlan.find({ available: true }).sort({ createdAt: -1 });
+    res.json(plans);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
 });
 
 // ---------- ORDER PLACE (LOGIN REQUIRED) ----------
+// Body: { vpsId, ram } — jo RAM option user ne dropdown se choose ki
 app.post("/api/vps/order", protect, async (req, res) => {
   try {
-    const { planId } = req.body;
-    const plan = plans.find((p) => p.id === planId);
+    const { vpsId, ram } = req.body;
 
+    const plan = await VpsPlan.findOne({ vpsId });
     if (!plan) {
       return res.status(404).json({ message: "Plan nahi mila." });
     }
 
+    const selectedOption = plan.ramOptions.find((o) => o.ram === ram);
+    if (!selectedOption) {
+      return res.status(400).json({ message: "Ye RAM option is plan me nahi hai." });
+    }
+
     const order = await Order.create({
       user: req.userId,
-      planName: plan.name,
-      price: plan.price,
+      planName: plan.label || plan.nameOrIp,
+      vpsId: plan.vpsId,
+      ram: selectedOption.ram,
+      price: selectedOption.price,
     });
 
     res.status(201).json({ message: "Order successful! Team aapse contact karegi.", order });
@@ -281,6 +307,78 @@ app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
     }
 
     res.json({ message: "Order status update ho gaya.", order });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ---------- SAARE VPS PLANS DEKHO (ADMIN ONLY - available/unavailable dono) ----------
+app.get("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
+  try {
+    const plans = await VpsPlan.find().sort({ createdAt: -1 });
+    res.json(plans);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ---------- NAYA VPS PLAN ADD KARO (ADMIN ONLY) ----------
+app.post("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
+  try {
+    const { vpsId, nameOrIp, label, company, ramOptions } = req.body;
+
+    if (!vpsId || !nameOrIp || !ramOptions || ramOptions.length === 0) {
+      return res.status(400).json({ message: "VPS ID, Name/IP aur kam se kam ek RAM option zaroori hai." });
+    }
+
+    const existing = await VpsPlan.findOne({ vpsId });
+    if (existing) {
+      return res.status(400).json({ message: "Ye VPS ID pehle se add hai." });
+    }
+
+    const plan = await VpsPlan.create({ vpsId, nameOrIp, label, company, ramOptions });
+    res.status(201).json({ message: "VPS plan add ho gaya!", plan });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ---------- VPS PLAN EDIT KARO (ADMIN ONLY) ----------
+app.put("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
+  try {
+    const { nameOrIp, label, company, ramOptions, available } = req.body;
+
+    const updateFields = {};
+    if (nameOrIp !== undefined) updateFields.nameOrIp = nameOrIp;
+    if (label !== undefined) updateFields.label = label;
+    if (company !== undefined) updateFields.company = company;
+    if (ramOptions !== undefined) updateFields.ramOptions = ramOptions;
+    if (available !== undefined) updateFields.available = available;
+
+    const plan = await VpsPlan.findByIdAndUpdate(
+      req.params.id,
+      updateFields,
+      { new: true, runValidators: true }
+    );
+
+    if (!plan) {
+      return res.status(404).json({ message: "Plan nahi mila." });
+    }
+
+    res.json({ message: "Plan update ho gaya.", plan });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ---------- VPS PLAN DELETE KARO (ADMIN ONLY) ----------
+app.delete("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
+  try {
+    const plan = await VpsPlan.findByIdAndDelete(req.params.id);
+    if (!plan) {
+      return res.status(404).json({ message: "Plan nahi mila." });
+    }
+    res.json({ message: "Plan delete ho gaya." });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
