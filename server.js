@@ -16,12 +16,45 @@ const connectDB = async () => {
   try {
     await mongoose.connect(process.env.MONGO_URI);
     console.log("MongoDB connected successfully ✅");
+    await seedAdmin();
   } catch (err) {
     console.error("MongoDB connection error ❌", err.message);
     process.exit(1);
   }
 };
 connectDB();
+
+// ==================== ADMIN AUTO-SEED ====================
+// .env / Render me ADMIN_EMAIL aur ADMIN_PASSWORD set karo,
+// server start hote hi ye check karega — agar wo email exist nahi karti to
+// khud admin account bana dega, agar exist karti hai to sirf role admin kar dega.
+async function seedAdmin() {
+  const adminEmail = process.env.ADMIN_EMAIL;
+  const adminPassword = process.env.ADMIN_PASSWORD;
+
+  if (!adminEmail || !adminPassword) return; // agar set nahi kiya to skip
+
+  try {
+    let admin = await User.findOne({ email: adminEmail.toLowerCase() });
+
+    if (!admin) {
+      const hashedPassword = await bcrypt.hash(adminPassword, 10);
+      admin = await User.create({
+        name: "Admin",
+        email: adminEmail.toLowerCase(),
+        password: hashedPassword,
+        role: "admin",
+      });
+      console.log(`Admin account auto-created ✅ (${adminEmail})`);
+    } else if (admin.role !== "admin") {
+      admin.role = "admin";
+      await admin.save();
+      console.log(`Existing user promoted to admin ✅ (${adminEmail})`);
+    }
+  } catch (err) {
+    console.error("Admin seed error:", err.message);
+  }
+}
 
 // ==================== SCHEMAS ====================
 const userSchema = new mongoose.Schema(
@@ -30,6 +63,7 @@ const userSchema = new mongoose.Schema(
     email: { type: String, required: true, unique: true, lowercase: true },
     password: { type: String, required: true },
     phone: { type: String },
+    role: { type: String, default: "user" }, // "user" ya "admin"
   },
   { timestamps: true }
 );
@@ -65,6 +99,19 @@ const protect = (req, res, next) => {
   }
 };
 
+// ==================== MIDDLEWARE (admin check - protect ke baad lagta hai) ====================
+const isAdmin = async (req, res, next) => {
+  try {
+    const user = await User.findById(req.userId);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ message: "Sirf admin ke liye access hai." });
+    }
+    next();
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+};
+
 // ==================== AUTH ROUTES ====================
 
 // ---------- REGISTER ----------
@@ -83,11 +130,17 @@ app.post("/api/auth/register", async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
+    // Agar ye email .env wali ADMIN_EMAIL se match kare, to isko admin bana do
+    const role = email.toLowerCase() === (process.env.ADMIN_EMAIL || "").toLowerCase()
+      ? "admin"
+      : "user";
+
     const user = await User.create({
       name,
       email,
       password: hashedPassword,
       phone,
+      role,
     });
 
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
@@ -97,7 +150,7 @@ app.post("/api/auth/register", async (req, res) => {
     res.status(201).json({
       message: "Account ban gaya!",
       token,
-      user: { id: user._id, name: user.name, email: user.email },
+      user: { id: user._id, name: user.name, email: user.email, role: user.role },
     });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
@@ -119,6 +172,15 @@ app.post("/api/auth/login", async (req, res) => {
       return res.status(400).json({ message: "Email ya password galat hai." });
     }
 
+    // Agar ye email ADMIN_EMAIL se match kare aur abhi tak admin nahi bana, to promote kar do
+    if (
+      email.toLowerCase() === (process.env.ADMIN_EMAIL || "").toLowerCase() &&
+      user.role !== "admin"
+    ) {
+      user.role = "admin";
+      await user.save();
+    }
+
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
       expiresIn: "7d",
     });
@@ -126,7 +188,7 @@ app.post("/api/auth/login", async (req, res) => {
     res.json({
       message: "Login successful!",
       token,
-      user: { id: user._id, name: user.name, email: user.email },
+      user: { id: user._id, name: user.name, email: user.email, role: user.role },
     });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
@@ -174,6 +236,51 @@ app.get("/api/vps/my-orders", protect, async (req, res) => {
   try {
     const orders = await Order.find({ user: req.userId }).sort({ createdAt: -1 });
     res.json(orders);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ==================== ADMIN ROUTES ====================
+
+// ---------- SAARE USERS DEKHO (ADMIN ONLY) ----------
+app.get("/api/admin/users", protect, isAdmin, async (req, res) => {
+  try {
+    const users = await User.find().select("-password").sort({ createdAt: -1 });
+    res.json(users);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ---------- SAARE ORDERS DEKHO (ADMIN ONLY) ----------
+app.get("/api/admin/orders", protect, isAdmin, async (req, res) => {
+  try {
+    const orders = await Order.find()
+      .populate("user", "name email phone")
+      .sort({ createdAt: -1 });
+    res.json(orders);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ---------- ORDER STATUS UPDATE KARO (ADMIN ONLY) ----------
+app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
+  try {
+    const { status } = req.body; // "pending" | "active" | "delivered" | "cancelled"
+
+    const order = await Order.findByIdAndUpdate(
+      req.params.id,
+      { status },
+      { new: true }
+    );
+
+    if (!order) {
+      return res.status(404).json({ message: "Order nahi mila." });
+    }
+
+    res.json({ message: "Order status update ho gaya.", order });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
