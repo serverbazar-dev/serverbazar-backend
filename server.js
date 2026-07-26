@@ -82,7 +82,11 @@ const orderSchema = new mongoose.Schema(
     vpsId: { type: String },
     nameOrIp: { type: String }, // plan ka listed IP/name jo user ne khareeda
     ram: { type: String },
-    price: { type: Number, required: true },
+    price: { type: Number, required: true }, // original plan price (before discount)
+    // ---- coupon info ----
+    couponCode: { type: String },
+    discountAmount: { type: Number, default: 0 },
+    finalAmount: { type: Number }, // price - discountAmount (jo actually charge hua)
     status: { type: String, default: "pending" }, // pending | active | delivered | cancelled
     // ---- payment info ----
     razorpayOrderId: { type: String },
@@ -120,6 +124,24 @@ const vpsPlanSchema = new mongoose.Schema(
 );
 const VpsPlan = mongoose.model("VpsPlan", vpsPlanSchema);
 
+// ---- Coupon codes (admin banata hai) ----
+const couponSchema = new mongoose.Schema(
+  {
+    code: { type: String, required: true, unique: true, uppercase: true, trim: true },
+    discountType: { type: String, enum: ["flat", "percent"], required: true }, // flat = ₹ off, percent = % off
+    discountValue: { type: Number, required: true }, // flat: amount, percent: 1-100
+    maxDiscountAmount: { type: Number }, // percent type ke liye upper cap (optional)
+    minOrderAmount: { type: Number, default: 0 }, // is amount se kam order pe coupon nahi chalega
+    usageLimit: { type: Number }, // total kitni baar use ho sakta hai (null = unlimited)
+    usedCount: { type: Number, default: 0 },
+    perUserLimit: { type: Number, default: 1 }, // ek user kitni baar use kar sakta hai
+    expiresAt: { type: Date }, // null = kabhi expire nahi hoga
+    active: { type: Boolean, default: true },
+  },
+  { timestamps: true }
+);
+const Coupon = mongoose.model("Coupon", couponSchema);
+
 // ---- Payment abhi pending hai, ye temporary record hai jab tak Razorpay confirm na kare ----
 // 15 min me khud expire ho jayega agar user payment complete nahi karta (TTL index)
 const pendingPaymentSchema = new mongoose.Schema(
@@ -130,7 +152,10 @@ const pendingPaymentSchema = new mongoose.Schema(
     nameOrIp: { type: String },
     planName: { type: String, required: true },
     ram: { type: String, required: true },
-    price: { type: Number, required: true },
+    price: { type: Number, required: true }, // original price
+    couponCode: { type: String },
+    discountAmount: { type: Number, default: 0 },
+    finalAmount: { type: Number, required: true }, // jo actually charge hua (Razorpay amount)
     createdAt: { type: Date, default: Date.now, expires: 900 }, // 900s = 15 min TTL
   }
 );
@@ -167,6 +192,121 @@ const isAdmin = async (req, res, next) => {
     res.status(500).json({ message: "Server error", error: err.message });
   }
 };
+
+// ==================== SECRET (.env) COUPONS ====================
+// Ye coupons DATABASE me kabhi save nahi hote — sirf .env se load hote hain.
+// Isliye ye admin panel ya /api/admin/coupons se kabhi dikhega nahi, na koi DB
+// dekh ke inko dhoond sakta hai. Jitne chaho utne SECRET_COUPON_<n>_CODE /
+// SECRET_COUPON_<n>_DISCOUNT pairs .env me daal do (n = 1, 2, 3...).
+function loadSecretCoupons() {
+  const list = [];
+  for (let i = 1; i <= 20; i++) {
+    const code = process.env[`SECRET_COUPON_${i}_CODE`];
+    const discount = process.env[`SECRET_COUPON_${i}_DISCOUNT`];
+    if (code && discount) {
+      list.push({ code: code.trim().toUpperCase(), discountValue: Number(discount) });
+    }
+  }
+  return list;
+}
+const SECRET_COUPONS = loadSecretCoupons();
+const SECRET_COUPON_PER_USER_LIMIT = 1; // har user isko sirf 1 baar use kar sakta hai
+
+// ==================== COUPON HELPER ====================
+// Ek coupon code, plan price aur user ke against valid hai ya nahi check karta hai.
+// Ye function backend ke andar hi use hota hai (create-payment aur validate dono jagah)
+// taaki logic ek hi jagah rahe aur dono kabhi out-of-sync na ho.
+async function checkCouponValidity(code, price, userId) {
+  if (!code) {
+    return { valid: false, message: "Coupon code do." };
+  }
+
+  const normalizedCode = code.trim().toUpperCase();
+
+  // ---- Pehle .env wale secret coupons check karo (DB me nahi hain) ----
+  const secretMatch = SECRET_COUPONS.find((c) => c.code === normalizedCode);
+  if (secretMatch) {
+    if (price < secretMatch.discountValue + 1) {
+      return { valid: false, message: "Ye coupon is order par apply nahi hoga." };
+    }
+
+    const timesUsedByUser = await Order.countDocuments({
+      user: userId,
+      couponCode: secretMatch.code,
+    });
+    if (timesUsedByUser >= SECRET_COUPON_PER_USER_LIMIT) {
+      return { valid: false, message: "Aap ye coupon pehle hi use kar chuke ho." };
+    }
+
+    const discountAmount = Math.min(secretMatch.discountValue, price - 1);
+    const finalAmount = price - discountAmount;
+
+    return {
+      valid: true,
+      coupon: { code: secretMatch.code },
+      discountAmount,
+      finalAmount,
+      message: "Coupon apply ho gaya!",
+    };
+  }
+
+  // ---- Warna normal DB wale coupons me dhoondo ----
+  const coupon = await Coupon.findOne({ code: normalizedCode });
+
+  if (!coupon || !coupon.active) {
+    return { valid: false, message: "Ye coupon code valid nahi hai." };
+  }
+
+  if (coupon.expiresAt && new Date() > coupon.expiresAt) {
+    return { valid: false, message: "Ye coupon expire ho chuka hai." };
+  }
+
+  if (coupon.usageLimit != null && coupon.usedCount >= coupon.usageLimit) {
+    return { valid: false, message: "Is coupon ki usage limit khatam ho gayi hai." };
+  }
+
+  if (price < coupon.minOrderAmount) {
+    return {
+      valid: false,
+      message: `Ye coupon sirf ₹${coupon.minOrderAmount} ya usse zyada ke order par chalega.`,
+    };
+  }
+
+  if (coupon.perUserLimit != null) {
+    const timesUsedByUser = await Order.countDocuments({
+      user: userId,
+      couponCode: coupon.code,
+    });
+    if (timesUsedByUser >= coupon.perUserLimit) {
+      return { valid: false, message: "Aap ye coupon pehle hi use kar chuke ho." };
+    }
+  }
+
+  // ---- discount calculate karo ----
+  let discountAmount = 0;
+  if (coupon.discountType === "flat") {
+    discountAmount = coupon.discountValue;
+  } else {
+    discountAmount = (price * coupon.discountValue) / 100;
+    if (coupon.maxDiscountAmount != null) {
+      discountAmount = Math.min(discountAmount, coupon.maxDiscountAmount);
+    }
+  }
+
+  // discount price se zyada nahi ho sakta, aur final price kam se kam ₹1 rahegi
+  discountAmount = Math.min(discountAmount, price - 1);
+  discountAmount = Math.max(0, Math.round(discountAmount));
+
+  const finalAmount = price - discountAmount;
+
+  return {
+    valid: true,
+    coupon,
+    discountAmount,
+    finalAmount,
+    message: "Coupon apply ho gaya!",
+  };
+}
 
 // ==================== AUTH ROUTES ====================
 
@@ -310,12 +450,51 @@ app.get("/api/vps/plans", async (req, res) => {
   }
 });
 
+// ---------- COUPON VALIDATE KARO (LOGIN REQUIRED) ----------
+// Modal me "Apply" button dabane par ye call hoga — payment shuru karne se pehle
+// discount preview dikhane ke liye. Ye order create NAHI karta, sirf check karta hai.
+// Body: { code, vpsId, ram }
+app.post("/api/coupons/validate", protect, async (req, res) => {
+  try {
+    const { code, vpsId, ram } = req.body;
+
+    if (!code) {
+      return res.status(400).json({ message: "Coupon code do." });
+    }
+
+    const plan = await VpsPlan.findOne({ vpsId });
+    if (!plan) {
+      return res.status(404).json({ message: "Plan nahi mila." });
+    }
+
+    const selectedOption = plan.ramOptions.find((o) => o.ram === ram);
+    if (!selectedOption) {
+      return res.status(400).json({ message: "Ye RAM option is plan me nahi hai." });
+    }
+
+    const result = await checkCouponValidity(code, selectedOption.price, req.userId);
+
+    if (!result.valid) {
+      return res.status(400).json({ message: result.message });
+    }
+
+    res.json({
+      message: result.message,
+      originalPrice: selectedOption.price,
+      discountAmount: result.discountAmount,
+      finalAmount: result.finalAmount,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
 // ---------- STEP 1: PAYMENT SHURU KARO (LOGIN REQUIRED) ----------
-// Body: { vpsId, ram }
+// Body: { vpsId, ram, couponCode (optional) }
 // Ye order KHUD nahi banata — sirf Razorpay order banata hai aur pending record save karta hai
 app.post("/api/vps/create-payment", protect, async (req, res) => {
   try {
-    const { vpsId, ram } = req.body;
+    const { vpsId, ram, couponCode } = req.body;
 
     const plan = await VpsPlan.findOne({ vpsId });
     if (!plan) {
@@ -328,7 +507,23 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
       return res.status(400).json({ message: "Ye RAM option is plan me nahi hai." });
     }
 
-    const amountInPaise = selectedOption.price * 100;
+    let discountAmount = 0;
+    let finalAmount = selectedOption.price;
+    let appliedCouponCode = undefined;
+
+    // Coupon bheja gaya hai to server khud se dobara validate karega
+    // (frontend ka discount kabhi trust nahi karna, warna koi bhi manually price ghata sakta hai)
+    if (couponCode) {
+      const result = await checkCouponValidity(couponCode, selectedOption.price, req.userId);
+      if (!result.valid) {
+        return res.status(400).json({ message: result.message });
+      }
+      discountAmount = result.discountAmount;
+      finalAmount = result.finalAmount;
+      appliedCouponCode = result.coupon.code;
+    }
+
+    const amountInPaise = finalAmount * 100;
 
     const razorpayOrder = await razorpay.orders.create({
       amount: amountInPaise,
@@ -345,6 +540,9 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
       planName: plan.label || plan.nameOrIp,
       ram: selectedOption.ram,
       price: selectedOption.price,
+      couponCode: appliedCouponCode,
+      discountAmount,
+      finalAmount,
     });
 
     res.json({
@@ -352,6 +550,8 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
       amount: amountInPaise,
       currency: "INR",
       keyId: process.env.RAZORPAY_KEY_ID, // sirf key_id frontend ko jata hai, secret nahi
+      discountAmount,
+      finalAmount,
     });
   } catch (err) {
     res.status(500).json({ message: "Payment order banane me error", error: err.message });
@@ -398,11 +598,19 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
       nameOrIp: pending.nameOrIp,
       ram: pending.ram,
       price: pending.price,
+      couponCode: pending.couponCode,
+      discountAmount: pending.discountAmount,
+      finalAmount: pending.finalAmount,
       status: "pending", // fulfillment status - admin isko update karega
       razorpayOrderId: razorpay_order_id,
       razorpayPaymentId: razorpay_payment_id,
       paymentStatus: "paid",
     });
+
+    // Coupon ka usedCount badhao (agar coupon use hua tha)
+    if (pending.couponCode) {
+      await Coupon.updateOne({ code: pending.couponCode }, { $inc: { usedCount: 1 } });
+    }
 
     await PendingPayment.deleteOne({ _id: pending._id });
 
@@ -556,6 +764,90 @@ app.delete("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
       return res.status(404).json({ message: "Plan nahi mila." });
     }
     res.json({ message: "Plan delete ho gaya." });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ---------- ADMIN COUPON ROUTES ----------
+app.get("/api/admin/coupons", protect, isAdmin, async (req, res) => {
+  try {
+    const coupons = await Coupon.find().sort({ createdAt: -1 });
+    res.json(coupons);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+app.post("/api/admin/coupons", protect, isAdmin, async (req, res) => {
+  try {
+    const {
+      code, discountType, discountValue, maxDiscountAmount,
+      minOrderAmount, usageLimit, perUserLimit, expiresAt, active,
+    } = req.body;
+
+    if (!code || !discountType || !discountValue) {
+      return res.status(400).json({ message: "Code, discount type aur discount value zaroori hai." });
+    }
+
+    const existing = await Coupon.findOne({ code: code.trim().toUpperCase() });
+    if (existing) {
+      return res.status(400).json({ message: "Ye coupon code pehle se hai." });
+    }
+
+    const coupon = await Coupon.create({
+      code: code.trim().toUpperCase(),
+      discountType,
+      discountValue,
+      maxDiscountAmount,
+      minOrderAmount,
+      usageLimit,
+      perUserLimit,
+      expiresAt,
+      active: active !== undefined ? !!active : true,
+    });
+
+    res.status(201).json({ message: "Coupon add ho gaya!", coupon });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+app.put("/api/admin/coupons/:id", protect, isAdmin, async (req, res) => {
+  try {
+    const {
+      discountType, discountValue, maxDiscountAmount,
+      minOrderAmount, usageLimit, perUserLimit, expiresAt, active,
+    } = req.body;
+
+    const updateFields = {};
+    if (discountType !== undefined) updateFields.discountType = discountType;
+    if (discountValue !== undefined) updateFields.discountValue = discountValue;
+    if (maxDiscountAmount !== undefined) updateFields.maxDiscountAmount = maxDiscountAmount;
+    if (minOrderAmount !== undefined) updateFields.minOrderAmount = minOrderAmount;
+    if (usageLimit !== undefined) updateFields.usageLimit = usageLimit;
+    if (perUserLimit !== undefined) updateFields.perUserLimit = perUserLimit;
+    if (expiresAt !== undefined) updateFields.expiresAt = expiresAt;
+    if (active !== undefined) updateFields.active = active;
+
+    const coupon = await Coupon.findByIdAndUpdate(req.params.id, updateFields, { new: true });
+    if (!coupon) {
+      return res.status(404).json({ message: "Coupon nahi mila." });
+    }
+
+    res.json({ message: "Coupon update ho gaya.", coupon });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+app.delete("/api/admin/coupons/:id", protect, isAdmin, async (req, res) => {
+  try {
+    const coupon = await Coupon.findByIdAndDelete(req.params.id);
+    if (!coupon) {
+      return res.status(404).json({ message: "Coupon nahi mila." });
+    }
+    res.json({ message: "Coupon delete ho gaya." });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
