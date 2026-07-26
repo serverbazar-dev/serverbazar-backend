@@ -114,6 +114,7 @@ const vpsPlanSchema = new mongoose.Schema(
       },
     ],
     available: { type: Boolean, default: true },
+    bestSeller: { type: Boolean, default: false }, // admin manually marks this as "Most Demanded"
   },
   { timestamps: true }
 );
@@ -203,7 +204,7 @@ app.post("/api/auth/register", async (req, res) => {
     res.status(201).json({
       message: "Account ban gaya!",
       token,
-      user: { id: user._id, name: user.name, email: user.email, role: user.role },
+      user: { id: user._id, name: user.name, email: user.email, phone: user.phone || "", role: user.role },
     });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
@@ -239,8 +240,60 @@ app.post("/api/auth/login", async (req, res) => {
     res.json({
       message: "Login successful!",
       token,
-      user: { id: user._id, name: user.name, email: user.email, role: user.role },
+      user: { id: user._id, name: user.name, email: user.email, phone: user.phone || "", role: user.role },
     });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ---------- MERA PROFILE (LOGIN REQUIRED) ----------
+// Profile page ke liye current user ki fresh details deta hai (naam, email, phone)
+app.get("/api/auth/me", protect, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId).select("-password");
+    if (!user) {
+      return res.status(404).json({ message: "User nahi mila." });
+    }
+    res.json({
+      id: user._id,
+      name: user.name,
+      email: user.email,
+      phone: user.phone || "",
+      role: user.role,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ---------- PASSWORD CHANGE KARO (LOGIN REQUIRED) ----------
+// Body: { oldPassword, newPassword }
+app.put("/api/auth/change-password", protect, async (req, res) => {
+  try {
+    const { oldPassword, newPassword } = req.body;
+
+    if (!oldPassword || !newPassword) {
+      return res.status(400).json({ message: "Purana aur naya password dono bharo." });
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({ message: "Naya password kam se kam 6 characters ka hona chahiye." });
+    }
+
+    const user = await User.findById(req.userId);
+    if (!user) {
+      return res.status(404).json({ message: "User nahi mila." });
+    }
+
+    const isMatch = await bcrypt.compare(oldPassword, user.password);
+    if (!isMatch) {
+      return res.status(400).json({ message: "Purana password galat hai." });
+    }
+
+    user.password = await bcrypt.hash(newPassword, 10);
+    await user.save();
+
+    res.json({ message: "Password successfully change ho gaya." });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
@@ -450,7 +503,7 @@ app.get("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
 
 app.post("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
   try {
-    const { vpsId, nameOrIp, label, company, ramOptions } = req.body;
+    const { vpsId, nameOrIp, label, company, ramOptions, bestSeller } = req.body;
 
     if (!vpsId || !nameOrIp || !ramOptions || ramOptions.length === 0) {
       return res.status(400).json({ message: "VPS ID, Name/IP aur kam se kam ek RAM option zaroori hai." });
@@ -461,7 +514,7 @@ app.post("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
       return res.status(400).json({ message: "Ye VPS ID pehle se add hai." });
     }
 
-    const plan = await VpsPlan.create({ vpsId, nameOrIp, label, company, ramOptions });
+    const plan = await VpsPlan.create({ vpsId, nameOrIp, label, company, ramOptions, bestSeller: !!bestSeller });
     res.status(201).json({ message: "VPS plan add ho gaya!", plan });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
@@ -470,7 +523,7 @@ app.post("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
 
 app.put("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
   try {
-    const { nameOrIp, label, company, ramOptions, available } = req.body;
+    const { nameOrIp, label, company, ramOptions, available, bestSeller } = req.body;
 
     const updateFields = {};
     if (nameOrIp !== undefined) updateFields.nameOrIp = nameOrIp;
@@ -478,6 +531,7 @@ app.put("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
     if (company !== undefined) updateFields.company = company;
     if (ramOptions !== undefined) updateFields.ramOptions = ramOptions;
     if (available !== undefined) updateFields.available = available;
+    if (bestSeller !== undefined) updateFields.bestSeller = bestSeller;
 
     const plan = await VpsPlan.findByIdAndUpdate(
       req.params.id,
