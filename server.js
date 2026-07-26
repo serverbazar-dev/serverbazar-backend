@@ -94,6 +94,8 @@ const orderSchema = new mongoose.Schema(
     deliveryPassword: { type: String },
     deliveryOS: { type: String },
     deliveredAt: { type: Date },
+    validityDays: { type: Number, default: 30 }, // kitne din ka plan hai
+    expiresAt: { type: Date }, // deliveredAt + validityDays se calculate hota hai
   },
   { timestamps: true }
 );
@@ -391,7 +393,7 @@ app.get("/api/admin/orders", protect, isAdmin, async (req, res) => {
 
 app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
   try {
-    const { status, deliveryIp, deliveryUsername, deliveryPassword, deliveryOS } = req.body;
+    const { status, deliveryIp, deliveryUsername, deliveryPassword, deliveryOS, validityDays } = req.body;
 
     const updateFields = {};
     if (status !== undefined) updateFields.status = status;
@@ -399,7 +401,14 @@ app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
     if (deliveryUsername !== undefined) updateFields.deliveryUsername = deliveryUsername;
     if (deliveryPassword !== undefined) updateFields.deliveryPassword = deliveryPassword;
     if (deliveryOS !== undefined) updateFields.deliveryOS = deliveryOS;
-    if (status === "delivered") updateFields.deliveredAt = new Date();
+
+    if (status === "delivered") {
+      const days = Number(validityDays) > 0 ? Number(validityDays) : 30;
+      const deliveredAt = new Date();
+      updateFields.deliveredAt = deliveredAt;
+      updateFields.validityDays = days;
+      updateFields.expiresAt = new Date(deliveredAt.getTime() + days * 24 * 60 * 60 * 1000);
+    }
 
     const order = await Order.findByIdAndUpdate(
       req.params.id,
