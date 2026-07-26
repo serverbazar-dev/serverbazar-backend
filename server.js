@@ -426,6 +426,19 @@ app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
   }
 });
 
+// ---------- ORDER DELETE KARO (ADMIN ONLY) ----------
+app.delete("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
+  try {
+    const order = await Order.findByIdAndDelete(req.params.id);
+    if (!order) {
+      return res.status(404).json({ message: "Order nahi mila." });
+    }
+    res.json({ message: "Order delete ho gaya." });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
 app.get("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
   try {
     const plans = await VpsPlan.find().sort({ createdAt: -1 });
