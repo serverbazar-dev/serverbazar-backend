@@ -4,12 +4,21 @@ const dotenv = require("dotenv");
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
+const Razorpay = require("razorpay");
 
 dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// ==================== RAZORPAY INSTANCE ====================
+// .env me RAZORPAY_KEY_ID aur RAZORPAY_KEY_SECRET set karo (secret sirf backend me, KABHI frontend me nahi)
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
+});
 
 // ==================== DATABASE CONNECT ====================
 const connectDB = async () => {
@@ -25,14 +34,11 @@ const connectDB = async () => {
 connectDB();
 
 // ==================== ADMIN AUTO-SEED ====================
-// .env / Render me ADMIN_EMAIL aur ADMIN_PASSWORD set karo,
-// server start hote hi ye check karega — agar wo email exist nahi karti to
-// khud admin account bana dega, agar exist karti hai to sirf role admin kar dega.
 async function seedAdmin() {
   const adminEmail = process.env.ADMIN_EMAIL;
   const adminPassword = process.env.ADMIN_PASSWORD;
 
-  if (!adminEmail || !adminPassword) return; // agar set nahi kiya to skip
+  if (!adminEmail || !adminPassword) return;
 
   try {
     let admin = await User.findOne({ email: adminEmail.toLowerCase() });
@@ -63,7 +69,7 @@ const userSchema = new mongoose.Schema(
     email: { type: String, required: true, unique: true, lowercase: true },
     password: { type: String, required: true },
     phone: { type: String },
-    role: { type: String, default: "user" }, // "user" ya "admin"
+    role: { type: String, default: "user" },
   },
   { timestamps: true }
 );
@@ -74,9 +80,20 @@ const orderSchema = new mongoose.Schema(
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     planName: { type: String, required: true },
     vpsId: { type: String },
+    nameOrIp: { type: String }, // plan ka listed IP/name jo user ne khareeda
     ram: { type: String },
     price: { type: Number, required: true },
-    status: { type: String, default: "pending" },
+    status: { type: String, default: "pending" }, // pending | active | delivered | cancelled
+    // ---- payment info ----
+    razorpayOrderId: { type: String },
+    razorpayPaymentId: { type: String },
+    paymentStatus: { type: String, default: "paid" }, // order sirf tabhi banta hai jab payment verify ho jaye
+    // ---- delivery details (admin fill karega jab VPS actually deliver kare) ----
+    deliveryIp: { type: String },
+    deliveryUsername: { type: String },
+    deliveryPassword: { type: String },
+    deliveryOS: { type: String },
+    deliveredAt: { type: Date },
   },
   { timestamps: true }
 );
@@ -84,13 +101,13 @@ const Order = mongoose.model("Order", orderSchema);
 
 const vpsPlanSchema = new mongoose.Schema(
   {
-    vpsId: { type: String, required: true, unique: true }, // jaise "vps-46"
-    nameOrIp: { type: String, required: true }, // jaise "103.109.18.x"
-    label: { type: String }, // jaise "Windows Server | Delhi DC"
-    company: { type: String, default: "Manual Delivery" }, // delivery type
+    vpsId: { type: String, required: true, unique: true },
+    nameOrIp: { type: String, required: true },
+    label: { type: String },
+    company: { type: String, default: "Manual Delivery" },
     ramOptions: [
       {
-        ram: { type: String, required: true }, // jaise "16 GB"
+        ram: { type: String, required: true },
         price: { type: Number, required: true },
       },
     ],
@@ -99,6 +116,22 @@ const vpsPlanSchema = new mongoose.Schema(
   { timestamps: true }
 );
 const VpsPlan = mongoose.model("VpsPlan", vpsPlanSchema);
+
+// ---- Payment abhi pending hai, ye temporary record hai jab tak Razorpay confirm na kare ----
+// 15 min me khud expire ho jayega agar user payment complete nahi karta (TTL index)
+const pendingPaymentSchema = new mongoose.Schema(
+  {
+    razorpayOrderId: { type: String, required: true, unique: true },
+    user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    vpsId: { type: String, required: true },
+    nameOrIp: { type: String },
+    planName: { type: String, required: true },
+    ram: { type: String, required: true },
+    price: { type: Number, required: true },
+    createdAt: { type: Date, default: Date.now, expires: 900 }, // 900s = 15 min TTL
+  }
+);
+const PendingPayment = mongoose.model("PendingPayment", pendingPaymentSchema);
 
 // ==================== MIDDLEWARE (auth check) ====================
 const protect = (req, res, next) => {
@@ -119,7 +152,7 @@ const protect = (req, res, next) => {
   }
 };
 
-// ==================== MIDDLEWARE (admin check - protect ke baad lagta hai) ====================
+// ==================== MIDDLEWARE (admin check) ====================
 const isAdmin = async (req, res, next) => {
   try {
     const user = await User.findById(req.userId);
@@ -134,7 +167,6 @@ const isAdmin = async (req, res, next) => {
 
 // ==================== AUTH ROUTES ====================
 
-// ---------- REGISTER ----------
 app.post("/api/auth/register", async (req, res) => {
   try {
     const { name, email, password, phone } = req.body;
@@ -150,7 +182,6 @@ app.post("/api/auth/register", async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Agar ye email .env wali ADMIN_EMAIL se match kare, to isko admin bana do
     const role = email.toLowerCase() === (process.env.ADMIN_EMAIL || "").toLowerCase()
       ? "admin"
       : "user";
@@ -177,7 +208,6 @@ app.post("/api/auth/register", async (req, res) => {
   }
 });
 
-// ---------- LOGIN ----------
 app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -192,7 +222,6 @@ app.post("/api/auth/login", async (req, res) => {
       return res.status(400).json({ message: "Email ya password galat hai." });
     }
 
-    // Agar ye email ADMIN_EMAIL se match kare aur abhi tak admin nahi bana, to promote kar do
     if (
       email.toLowerCase() === (process.env.ADMIN_EMAIL || "").toLowerCase() &&
       user.role !== "admin"
@@ -217,7 +246,6 @@ app.post("/api/auth/login", async (req, res) => {
 
 // ==================== VPS ROUTES ====================
 
-// ---------- PLANS LIST (public, login ki zarurat nahi) ----------
 app.get("/api/vps/plans", async (req, res) => {
   try {
     const plans = await VpsPlan.find({ available: true }).sort({ createdAt: -1 });
@@ -227,9 +255,10 @@ app.get("/api/vps/plans", async (req, res) => {
   }
 });
 
-// ---------- ORDER PLACE (LOGIN REQUIRED) ----------
-// Body: { vpsId, ram } — jo RAM option user ne dropdown se choose ki
-app.post("/api/vps/order", protect, async (req, res) => {
+// ---------- STEP 1: PAYMENT SHURU KARO (LOGIN REQUIRED) ----------
+// Body: { vpsId, ram }
+// Ye order KHUD nahi banata — sirf Razorpay order banata hai aur pending record save karta hai
+app.post("/api/vps/create-payment", protect, async (req, res) => {
   try {
     const { vpsId, ram } = req.body;
 
@@ -238,22 +267,93 @@ app.post("/api/vps/order", protect, async (req, res) => {
       return res.status(404).json({ message: "Plan nahi mila." });
     }
 
+    // Price hamesha server se lo, frontend se kabhi trust mat karo
     const selectedOption = plan.ramOptions.find((o) => o.ram === ram);
     if (!selectedOption) {
       return res.status(400).json({ message: "Ye RAM option is plan me nahi hai." });
     }
 
-    const order = await Order.create({
+    const amountInPaise = selectedOption.price * 100;
+
+    const razorpayOrder = await razorpay.orders.create({
+      amount: amountInPaise,
+      currency: "INR",
+      receipt: `rcpt_${vpsId}_${Date.now()}`,
+    });
+
+    // Pending record — jab tak payment verify nahi hota, actual Order nahi banega
+    await PendingPayment.create({
+      razorpayOrderId: razorpayOrder.id,
       user: req.userId,
-      planName: plan.label || plan.nameOrIp,
       vpsId: plan.vpsId,
+      nameOrIp: plan.nameOrIp,
+      planName: plan.label || plan.nameOrIp,
       ram: selectedOption.ram,
       price: selectedOption.price,
     });
 
-    res.status(201).json({ message: "Order successful! Team aapse contact karegi.", order });
+    res.json({
+      razorpayOrderId: razorpayOrder.id,
+      amount: amountInPaise,
+      currency: "INR",
+      keyId: process.env.RAZORPAY_KEY_ID, // sirf key_id frontend ko jata hai, secret nahi
+    });
   } catch (err) {
-    res.status(500).json({ message: "Server error", error: err.message });
+    res.status(500).json({ message: "Payment order banane me error", error: err.message });
+  }
+});
+
+// ---------- STEP 2: PAYMENT VERIFY KARO (LOGIN REQUIRED) ----------
+// Body: { razorpay_order_id, razorpay_payment_id, razorpay_signature }
+// Signature valid hone par hi asli Order banega
+app.post("/api/vps/verify-payment", protect, async (req, res) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ message: "Payment details incomplete hain." });
+    }
+
+    // ---- Signature verify: HMAC-SHA256(order_id + "|" + payment_id, key_secret) ----
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest("hex");
+
+    if (expectedSignature !== razorpay_signature) {
+      return res.status(400).json({ message: "Payment verify nahi ho paya. Signature match nahi hui." });
+    }
+
+    // Pending record dhundo jo humne create-payment step me banaya tha
+    const pending = await PendingPayment.findOne({ razorpayOrderId: razorpay_order_id });
+    if (!pending) {
+      return res.status(404).json({ message: "Payment record nahi mila ya expire ho gaya." });
+    }
+
+    // Security: jisne payment shuru ki thi, wahi verify kar sakta hai
+    if (pending.user.toString() !== req.userId) {
+      return res.status(403).json({ message: "Ye payment aapki nahi hai." });
+    }
+
+    // Ab jaake asli Order banega — payment success confirm hone ke baad
+    const order = await Order.create({
+      user: pending.user,
+      planName: pending.planName,
+      vpsId: pending.vpsId,
+      nameOrIp: pending.nameOrIp,
+      ram: pending.ram,
+      price: pending.price,
+      status: "pending", // fulfillment status - admin isko update karega
+      razorpayOrderId: razorpay_order_id,
+      razorpayPaymentId: razorpay_payment_id,
+      paymentStatus: "paid",
+    });
+
+    await PendingPayment.deleteOne({ _id: pending._id });
+
+    res.status(201).json({ message: "Payment successful! Order confirm ho gaya.", order });
+  } catch (err) {
+    res.status(500).json({ message: "Payment verify karte waqt error", error: err.message });
   }
 });
 
@@ -269,7 +369,6 @@ app.get("/api/vps/my-orders", protect, async (req, res) => {
 
 // ==================== ADMIN ROUTES ====================
 
-// ---------- SAARE USERS DEKHO (ADMIN ONLY) ----------
 app.get("/api/admin/users", protect, isAdmin, async (req, res) => {
   try {
     const users = await User.find().select("-password").sort({ createdAt: -1 });
@@ -279,7 +378,6 @@ app.get("/api/admin/users", protect, isAdmin, async (req, res) => {
   }
 });
 
-// ---------- SAARE ORDERS DEKHO (ADMIN ONLY) ----------
 app.get("/api/admin/orders", protect, isAdmin, async (req, res) => {
   try {
     const orders = await Order.find()
@@ -291,14 +389,21 @@ app.get("/api/admin/orders", protect, isAdmin, async (req, res) => {
   }
 });
 
-// ---------- ORDER STATUS UPDATE KARO (ADMIN ONLY) ----------
 app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
   try {
-    const { status } = req.body; // "pending" | "active" | "delivered" | "cancelled"
+    const { status, deliveryIp, deliveryUsername, deliveryPassword, deliveryOS } = req.body;
+
+    const updateFields = {};
+    if (status !== undefined) updateFields.status = status;
+    if (deliveryIp !== undefined) updateFields.deliveryIp = deliveryIp;
+    if (deliveryUsername !== undefined) updateFields.deliveryUsername = deliveryUsername;
+    if (deliveryPassword !== undefined) updateFields.deliveryPassword = deliveryPassword;
+    if (deliveryOS !== undefined) updateFields.deliveryOS = deliveryOS;
+    if (status === "delivered") updateFields.deliveredAt = new Date();
 
     const order = await Order.findByIdAndUpdate(
       req.params.id,
-      { status },
+      updateFields,
       { new: true }
     );
 
@@ -306,13 +411,12 @@ app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
       return res.status(404).json({ message: "Order nahi mila." });
     }
 
-    res.json({ message: "Order status update ho gaya.", order });
+    res.json({ message: "Order update ho gaya.", order });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
 
-// ---------- SAARE VPS PLANS DEKHO (ADMIN ONLY - available/unavailable dono) ----------
 app.get("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
   try {
     const plans = await VpsPlan.find().sort({ createdAt: -1 });
@@ -322,7 +426,6 @@ app.get("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
   }
 });
 
-// ---------- NAYA VPS PLAN ADD KARO (ADMIN ONLY) ----------
 app.post("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
   try {
     const { vpsId, nameOrIp, label, company, ramOptions } = req.body;
@@ -343,7 +446,6 @@ app.post("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
   }
 });
 
-// ---------- VPS PLAN EDIT KARO (ADMIN ONLY) ----------
 app.put("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
   try {
     const { nameOrIp, label, company, ramOptions, available } = req.body;
@@ -371,7 +473,6 @@ app.put("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
   }
 });
 
-// ---------- VPS PLAN DELETE KARO (ADMIN ONLY) ----------
 app.delete("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
   try {
     const plan = await VpsPlan.findByIdAndDelete(req.params.id);
