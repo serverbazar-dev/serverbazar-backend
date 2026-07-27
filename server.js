@@ -79,6 +79,7 @@ const orderSchema = new mongoose.Schema(
   {
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     planName: { type: String, required: true },
+    category: { type: String, enum: ["vps", "linux"], default: "vps" }, // vps ya linux
     vpsId: { type: String },
     nameOrIp: { type: String }, // plan ka listed IP/name jo user ne khareeda
     ram: { type: String },
@@ -119,6 +120,7 @@ const vpsPlanSchema = new mongoose.Schema(
     ],
     available: { type: Boolean, default: true },
     bestSeller: { type: Boolean, default: false }, // admin manually marks this as "Most Demanded"
+    category: { type: String, enum: ["vps", "linux"], default: "vps" }, // "vps" ya "linux"
   },
   { timestamps: true }
 );
@@ -151,6 +153,7 @@ const pendingPaymentSchema = new mongoose.Schema(
     vpsId: { type: String, required: true },
     nameOrIp: { type: String },
     planName: { type: String, required: true },
+    category: { type: String, enum: ["vps", "linux"], default: "vps" },
     ram: { type: String, required: true },
     price: { type: Number, required: true }, // original price
     couponCode: { type: String },
@@ -439,11 +442,13 @@ app.put("/api/auth/change-password", protect, async (req, res) => {
   }
 });
 
-// ==================== VPS ROUTES ====================
+// ==================== VPS / LINUX PLAN ROUTES ====================
+// Dono categories ("vps" aur "linux") same routes use karte hain, sirf ?category= query se filter hota hai.
 
 app.get("/api/vps/plans", async (req, res) => {
   try {
-    const plans = await VpsPlan.find({ available: true }).sort({ createdAt: -1 });
+    const category = req.query.category === "linux" ? "linux" : "vps";
+    const plans = await VpsPlan.find({ available: true, category }).sort({ createdAt: -1 });
     res.json(plans);
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
@@ -453,16 +458,17 @@ app.get("/api/vps/plans", async (req, res) => {
 // ---------- COUPON VALIDATE KARO (LOGIN REQUIRED) ----------
 // Modal me "Apply" button dabane par ye call hoga — payment shuru karne se pehle
 // discount preview dikhane ke liye. Ye order create NAHI karta, sirf check karta hai.
-// Body: { code, vpsId, ram }
+// Body: { code, vpsId, ram, category }
 app.post("/api/coupons/validate", protect, async (req, res) => {
   try {
-    const { code, vpsId, ram } = req.body;
+    const { code, vpsId, ram, category } = req.body;
+    const cat = category === "linux" ? "linux" : "vps";
 
     if (!code) {
       return res.status(400).json({ message: "Coupon code do." });
     }
 
-    const plan = await VpsPlan.findOne({ vpsId });
+    const plan = await VpsPlan.findOne({ vpsId, category: cat });
     if (!plan) {
       return res.status(404).json({ message: "Plan nahi mila." });
     }
@@ -490,13 +496,14 @@ app.post("/api/coupons/validate", protect, async (req, res) => {
 });
 
 // ---------- STEP 1: PAYMENT SHURU KARO (LOGIN REQUIRED) ----------
-// Body: { vpsId, ram, couponCode (optional) }
+// Body: { vpsId, ram, couponCode (optional), category }
 // Ye order KHUD nahi banata — sirf Razorpay order banata hai aur pending record save karta hai
 app.post("/api/vps/create-payment", protect, async (req, res) => {
   try {
-    const { vpsId, ram, couponCode } = req.body;
+    const { vpsId, ram, couponCode, category } = req.body;
+    const cat = category === "linux" ? "linux" : "vps";
 
-    const plan = await VpsPlan.findOne({ vpsId });
+    const plan = await VpsPlan.findOne({ vpsId, category: cat });
     if (!plan) {
       return res.status(404).json({ message: "Plan nahi mila." });
     }
@@ -536,6 +543,7 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
       razorpayOrderId: razorpayOrder.id,
       user: req.userId,
       vpsId: plan.vpsId,
+      category: cat,
       nameOrIp: plan.nameOrIp,
       planName: plan.label || plan.nameOrIp,
       ram: selectedOption.ram,
@@ -594,6 +602,7 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
     const order = await Order.create({
       user: pending.user,
       planName: pending.planName,
+      category: pending.category,
       vpsId: pending.vpsId,
       nameOrIp: pending.nameOrIp,
       ram: pending.ram,
@@ -621,9 +630,14 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
 });
 
 // ---------- MERE ORDERS (LOGIN REQUIRED) ----------
+// Optional ?category=vps|linux se filter kar sakte ho
 app.get("/api/vps/my-orders", protect, async (req, res) => {
   try {
-    const orders = await Order.find({ user: req.userId }).sort({ createdAt: -1 });
+    const filter = { user: req.userId };
+    if (req.query.category === "vps" || req.query.category === "linux") {
+      filter.category = req.query.category;
+    }
+    const orders = await Order.find(filter).sort({ createdAt: -1 });
     res.json(orders);
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
@@ -700,9 +714,15 @@ app.delete("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
   }
 });
 
+// Optional ?category=vps|linux — agar diya hai to sirf usi category ke plans aayenge,
+// warna (jaise purane admin panel calls) sab plans aa jayenge.
 app.get("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
   try {
-    const plans = await VpsPlan.find().sort({ createdAt: -1 });
+    const filter = {};
+    if (req.query.category === "vps" || req.query.category === "linux") {
+      filter.category = req.query.category;
+    }
+    const plans = await VpsPlan.find(filter).sort({ createdAt: -1 });
     res.json(plans);
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
@@ -711,7 +731,7 @@ app.get("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
 
 app.post("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
   try {
-    const { vpsId, nameOrIp, label, company, ramOptions, bestSeller } = req.body;
+    const { vpsId, nameOrIp, label, company, ramOptions, bestSeller, category } = req.body;
 
     if (!vpsId || !nameOrIp || !ramOptions || ramOptions.length === 0) {
       return res.status(400).json({ message: "VPS ID, Name/IP aur kam se kam ek RAM option zaroori hai." });
@@ -722,8 +742,16 @@ app.post("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
       return res.status(400).json({ message: "Ye VPS ID pehle se add hai." });
     }
 
-    const plan = await VpsPlan.create({ vpsId, nameOrIp, label, company, ramOptions, bestSeller: !!bestSeller });
-    res.status(201).json({ message: "VPS plan add ho gaya!", plan });
+    const plan = await VpsPlan.create({
+      vpsId,
+      nameOrIp,
+      label,
+      company,
+      ramOptions,
+      bestSeller: !!bestSeller,
+      category: category === "linux" ? "linux" : "vps",
+    });
+    res.status(201).json({ message: "Plan add ho gaya!", plan });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
@@ -731,7 +759,7 @@ app.post("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
 
 app.put("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
   try {
-    const { nameOrIp, label, company, ramOptions, available, bestSeller } = req.body;
+    const { nameOrIp, label, company, ramOptions, available, bestSeller, category } = req.body;
 
     const updateFields = {};
     if (nameOrIp !== undefined) updateFields.nameOrIp = nameOrIp;
@@ -740,6 +768,7 @@ app.put("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
     if (ramOptions !== undefined) updateFields.ramOptions = ramOptions;
     if (available !== undefined) updateFields.available = available;
     if (bestSeller !== undefined) updateFields.bestSeller = bestSeller;
+    if (category !== undefined) updateFields.category = category === "linux" ? "linux" : "vps";
 
     const plan = await VpsPlan.findByIdAndUpdate(
       req.params.id,
