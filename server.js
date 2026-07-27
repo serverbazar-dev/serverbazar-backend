@@ -556,7 +556,8 @@ app.put("/api/auth/change-password", protect, async (req, res) => {
 app.get("/api/vps/plans", async (req, res) => {
   try {
     const category = req.query.category === "linux" ? "linux" : "vps";
-    const plans = await VpsPlan.find({ available: true, category }).sort({ createdAt: -1 });
+    // available: true hatao — saare plans aayenge
+    const plans = await VpsPlan.find({ category }).sort({ createdAt: -1 });
     res.json(plans);
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
