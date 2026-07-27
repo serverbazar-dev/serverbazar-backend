@@ -5,6 +5,7 @@ const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
+const https = require("https");
 const Razorpay = require("razorpay");
 
 dotenv.config();
@@ -60,6 +61,101 @@ async function seedAdmin() {
   } catch (err) {
     console.error("Admin seed error:", err.message);
   }
+}
+
+// ==================== TELEGRAM ORDER ALERTS ====================
+// .env me daalo:
+//   TELEGRAM_BOT_TOKEN=              (BotFather se milega)
+//   TELEGRAM_ADMIN_CHAT_ID=id1,id2   (ek ya zyada admin chat ids, comma se separate)
+// Dono set na ho to alert silently skip ho jaata hai — baaki app normally chalta rahega.
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// Ek chat id ko ek message bhejta hai (single request)
+function sendTelegramMessageToChat(token, chatId, text) {
+  const payload = JSON.stringify({
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  });
+
+  const options = {
+    hostname: "api.telegram.org",
+    path: `/bot${token}/sendMessage`,
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(payload),
+    },
+  };
+
+  const req = https.request(options, (res) => {
+    let data = "";
+    res.on("data", (chunk) => (data += chunk));
+    res.on("end", () => {
+      if (res.statusCode >= 400) {
+        console.error(`Telegram alert failed (chat ${chatId}):`, res.statusCode, data);
+      }
+    });
+  });
+
+  req.on("error", (err) => console.error(`Telegram alert error (chat ${chatId}):`, err.message));
+  req.write(payload);
+  req.end();
+}
+
+// Saare admins ko ek saath bhejta hai — TELEGRAM_ADMIN_CHAT_ID me jitne bhi
+// comma-separated chat ids hon, sabko same message chala jaata hai.
+function sendTelegramMessage(text) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const rawChatIds = process.env.TELEGRAM_ADMIN_CHAT_ID;
+
+  if (!token || !rawChatIds) {
+    console.warn("Telegram alert skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_ADMIN_CHAT_ID set nahi hai.");
+    return;
+  }
+
+  const chatIds = rawChatIds
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+
+  chatIds.forEach((chatId) => sendTelegramMessageToChat(token, chatId, text));
+}
+
+// Naya order confirm hote hi admin ko bhejne wala message banata hai
+function buildOrderAlertMessage({ user, order }) {
+  const categoryLabel = order.category === "linux" ? "🐧 Linux IP" : "🖥️ VPS";
+
+  const lines = [
+    `🛒 <b>Naya Order Mila!</b>`,
+    ``,
+    `${categoryLabel} <b>Order</b>`,
+    `👤 <b>Naam:</b> ${escapeHtml(user?.name)}`,
+    `📧 <b>Email:</b> ${escapeHtml(user?.email)}`,
+    `🌐 <b>Plan / IP:</b> ${escapeHtml(order.nameOrIp || order.planName)}`,
+    `💾 <b>RAM:</b> ${escapeHtml(order.ram || "-")}`,
+    `💰 <b>Price:</b> ₹${order.price}`,
+  ];
+
+  if (order.couponCode) {
+    lines.push(`🏷️ <b>Coupon:</b> ${escapeHtml(order.couponCode)} (−₹${order.discountAmount})`);
+  } else {
+    lines.push(`🏷️ <b>Coupon:</b> Koi nahi`);
+  }
+
+  lines.push(`✅ <b>Final Paid:</b> ₹${order.finalAmount}`);
+  lines.push(``);
+  lines.push(`🧾 <b>Payment ID:</b> <code>${escapeHtml(order.razorpayPaymentId)}</code>`);
+  lines.push(`🆔 <b>Order ID:</b> <code>${escapeHtml(order._id)}</code>`);
+
+  return lines.join("\n");
 }
 
 // ==================== SCHEMAS ====================
@@ -622,6 +718,15 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
     }
 
     await PendingPayment.deleteOne({ _id: pending._id });
+
+    // ---- Telegram alert: admin ko turant naya order notify karo ----
+    // Ye fire-and-forget hai — Telegram fail bhi ho jaye to order response par asar nahi padega.
+    try {
+      const orderedByUser = await User.findById(order.user).select("name email");
+      sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
+    } catch (alertErr) {
+      console.error("Telegram alert bhejte waqt error:", alertErr.message);
+    }
 
     res.status(201).json({ message: "Payment successful! Order confirm ho gaya.", order });
   } catch (err) {
