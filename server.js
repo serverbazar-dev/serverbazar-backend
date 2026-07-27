@@ -259,6 +259,18 @@ const pendingPaymentSchema = new mongoose.Schema(
   }
 );
 const PendingPayment = mongoose.model("PendingPayment", pendingPaymentSchema);
+// ==================== NOTICE SCHEMA ====================
+const noticeSchema = new mongoose.Schema(
+  {
+    title: { type: String, required: true },
+    message: { type: String, required: true },
+    category: { type: String, enum: ["vps", "linux", "all"], default: "all" },
+    active: { type: Boolean, default: true },
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  },
+  { timestamps: true }
+);
+const Notice = mongoose.model("Notice", noticeSchema);
 
 // ==================== MIDDLEWARE (auth check) ====================
 const protect = (req, res, next) => {
@@ -982,6 +994,90 @@ app.delete("/api/admin/coupons/:id", protect, isAdmin, async (req, res) => {
       return res.status(404).json({ message: "Coupon nahi mila." });
     }
     res.json({ message: "Coupon delete ho gaya." });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+// ==================== NOTICE ROUTES (PUBLIC) ====================
+app.get("/api/notices", async (req, res) => {
+  try {
+    const { category } = req.query;
+    const filter = { active: true };
+    
+    if (category === "vps" || category === "linux") {
+      filter.$or = [
+        { category: category },
+        { category: "all" }
+      ];
+    }
+    
+    const notices = await Notice.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(10);
+    
+    res.json(notices);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ==================== NOTICE ROUTES (ADMIN) ====================
+app.get("/api/admin/notices", protect, isAdmin, async (req, res) => {
+  try {
+    const notices = await Notice.find()
+      .populate("createdBy", "name email")
+      .sort({ createdAt: -1 });
+    res.json(notices);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+app.post("/api/admin/notices", protect, isAdmin, async (req, res) => {
+  try {
+    const { title, message, category } = req.body;
+    
+    if (!title || !message) {
+      return res.status(400).json({ message: "Title aur message dono bharo." });
+    }
+    
+    const notice = await Notice.create({
+      title,
+      message,
+      category: category || "all",
+      createdBy: req.userId,
+    });
+    
+    res.status(201).json({ message: "Notice create ho gaya!", notice });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+app.delete("/api/admin/notices/:id", protect, isAdmin, async (req, res) => {
+  try {
+    const notice = await Notice.findByIdAndDelete(req.params.id);
+    if (!notice) {
+      return res.status(404).json({ message: "Notice nahi mila." });
+    }
+    res.json({ message: "Notice delete ho gaya." });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+app.put("/api/admin/notices/:id", protect, isAdmin, async (req, res) => {
+  try {
+    const { active } = req.body;
+    const notice = await Notice.findByIdAndUpdate(
+      req.params.id,
+      { active },
+      { new: true }
+    );
+    if (!notice) {
+      return res.status(404).json({ message: "Notice nahi mila." });
+    }
+    res.json({ message: "Notice update ho gaya.", notice });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
