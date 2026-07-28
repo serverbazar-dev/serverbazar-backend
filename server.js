@@ -160,7 +160,10 @@ function buildOrderAlertMessage({ user, order }) {
 
   lines.push(`✅ <b>Final Paid:</b> ₹${order.finalAmount}`);
   lines.push(``);
-  lines.push(`🧾 <b>Payment ID:</b> <code>${escapeHtml(order.razorpayPaymentId)}</code>`);
+  const gatewayLabel = order.paymentGateway === "cashfree" ? "Cashfree" : "Razorpay";
+  const paymentId = order.paymentGateway === "cashfree" ? order.cfPaymentId : order.razorpayPaymentId;
+  lines.push(`💳 <b>Gateway:</b> ${gatewayLabel}`);
+  lines.push(`🧾 <b>Payment ID:</b> <code>${escapeHtml(paymentId || "-")}</code>`);
   lines.push(`🆔 <b>Order ID:</b> <code>${escapeHtml(order._id)}</code>`);
 
   return lines.join("\n");
