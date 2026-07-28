@@ -1046,7 +1046,7 @@ app.post("/api/software/create-order", protect, async (req, res) => {
       orderId: order._id,
       softwareName: software.name,
       amount: software.price,
-      upiId: "jannat2002@ybl"
+      upiId: "jannat202@ybl"
     });
 
   } catch (err) {
@@ -1584,7 +1584,7 @@ app.get("/", (req, res) => {
 app.get("/api/upi/generate-qr", async (req, res) => {
   try {
     const amount = req.query.amount || "";
-    const upiId = "jannat2002@ybl";
+    const upiId = "jannat202@ybl";
     const name = "ServerBazar";
     
     // UPI deep link - yehi se QR banta hai
