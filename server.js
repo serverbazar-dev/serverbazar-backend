@@ -11,7 +11,11 @@ const Razorpay = require("razorpay");
 dotenv.config();
 
 const { Cashfree, CFEnvironment } = require("cashfree-pg");
-let cashfreeClient = new Cashfree(CFEnvironment.SANDBOX, process.env.CASHFREE_CLIENT_ID, process.env.CASHFREE_CLIENT_SECRET);
+let cashfreeClient = new Cashfree(
+  process.env.CASHFREE_ENV === "production" ? CFEnvironment.PRODUCTION : CFEnvironment.SANDBOX,
+  process.env.CASHFREE_CLIENT_ID,
+  process.env.CASHFREE_CLIENT_SECRET
+);
 const ACTIVE_GATEWAY = (process.env.PAYMENT_GATEWAY || "razorpay").toLowerCase();
 
 const app = express();
