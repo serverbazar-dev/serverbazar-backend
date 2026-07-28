@@ -305,7 +305,7 @@ const softwareSchema = new mongoose.Schema(
     image: { type: String, default: "" },
     category: { type: String, default: "software" },
     available: { type: Boolean, default: true },
-    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    createdBy: { type: String, default: "software_admin" }, // <-- Type change kiya aur default daal diya
     version: { type: String },
     fileUrl: { type: String },
     systemRequirements: { type: String },
@@ -1374,16 +1374,15 @@ app.post("/api/admin/software", isSoftwareAdmin, async (req, res) => {
     }
 
     const software = await Software.create({
-      name,
-      description,
-      price,
-      image: image || "",
-      version,
-      fileUrl,
-      systemRequirements,
-      createdBy: "software_admin",
-      available: true
-    });
+  name,
+  description,
+  price,
+  image: image || "",
+  version,
+  fileUrl,
+  systemRequirements,
+  available: true
+});
 
     res.status(201).json({ message: "Software add ho gaya!", software });
   } catch (err) {
