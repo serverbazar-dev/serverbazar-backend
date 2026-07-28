@@ -10,6 +10,10 @@ const Razorpay = require("razorpay");
 
 dotenv.config();
 
+const { Cashfree, CFEnvironment } = require("cashfree-pg");
+let cashfreeClient = new Cashfree(CFEnvironment.SANDBOX, process.env.CASHFREE_CLIENT_ID, process.env.CASHFREE_CLIENT_SECRET);
+const ACTIVE_GATEWAY = (process.env.PAYMENT_GATEWAY || "razorpay").toLowerCase();
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -188,6 +192,8 @@ const orderSchema = new mongoose.Schema(
     // ---- payment info ----
     razorpayOrderId: { type: String },
     razorpayPaymentId: { type: String },
+    cfOrderId: { type: String },
+cfPaymentId: { type: String },
     paymentStatus: { type: String, default: "paid" }, // order sirf tabhi banta hai jab payment verify ho jaye
     // ---- delivery details (admin fill karega jab VPS actually deliver kare) ----
     deliveryIp: { type: String },
@@ -244,7 +250,9 @@ const Coupon = mongoose.model("Coupon", couponSchema);
 // 15 min me khud expire ho jayega agar user payment complete nahi karta (TTL index)
 const pendingPaymentSchema = new mongoose.Schema(
   {
-    razorpayOrderId: { type: String, required: true, unique: true },
+    razorpayOrderId: { type: String, unique: true, sparse: true },
+cfOrderId: { type: String, unique: true, sparse: true },
+paymentGateway: { type: String, enum: ["razorpay", "cashfree"], default: "razorpay" },
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     vpsId: { type: String, required: true },
     nameOrIp: { type: String },
@@ -639,6 +647,47 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
       appliedCouponCode = result.coupon.code;
     }
 
+    if (ACTIVE_GATEWAY === "cashfree") {
+      const user = await User.findById(req.userId);
+      const cfOrderId = `sb_${vpsId}_${Date.now()}`;
+
+      const cfOrder = await cashfreeClient.PGCreateOrder({
+        order_id: cfOrderId,
+        order_amount: finalAmount,
+        order_currency: "INR",
+        customer_details: {
+          customer_id: String(req.userId),
+          customer_name: user?.name || "Customer",
+          customer_email: user?.email || "test@example.com",
+          customer_phone: user?.phone || "9999999999",
+        },
+      });
+
+      await PendingPayment.create({
+        cfOrderId,
+        paymentGateway: "cashfree",
+        user: req.userId,
+        vpsId: plan.vpsId,
+        category: cat,
+        nameOrIp: plan.nameOrIp,
+        planName: plan.label || plan.nameOrIp,
+        ram: selectedOption.ram,
+        price: selectedOption.price,
+        couponCode: appliedCouponCode,
+        discountAmount,
+        finalAmount,
+      });
+
+      return res.json({
+        gateway: "cashfree",
+        mode: process.env.CASHFREE_ENV === "production" ? "production" : "sandbox",
+        orderId: cfOrderId,
+        paymentSessionId: cfOrder.data.payment_session_id,
+        discountAmount,
+        finalAmount,
+      });
+    }
+
     const amountInPaise = finalAmount * 100;
 
     const razorpayOrder = await razorpay.orders.create({
@@ -647,9 +696,9 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
       receipt: `rcpt_${vpsId}_${Date.now()}`,
     });
 
-    // Pending record — jab tak payment verify nahi hota, actual Order nahi banega
     await PendingPayment.create({
       razorpayOrderId: razorpayOrder.id,
+      paymentGateway: "razorpay",
       user: req.userId,
       vpsId: plan.vpsId,
       category: cat,
@@ -663,10 +712,11 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
     });
 
     res.json({
+      gateway: "razorpay",
       razorpayOrderId: razorpayOrder.id,
       amount: amountInPaise,
       currency: "INR",
-      keyId: process.env.RAZORPAY_KEY_ID, // sirf key_id frontend ko jata hai, secret nahi
+      keyId: process.env.RAZORPAY_KEY_ID,
       discountAmount,
       finalAmount,
     });
@@ -734,6 +784,71 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
 
     // ---- Telegram alert: admin ko turant naya order notify karo ----
     // Ye fire-and-forget hai — Telegram fail bhi ho jaye to order response par asar nahi padega.
+    try {
+      const orderedByUser = await User.findById(order.user).select("name email");
+      sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
+    } catch (alertErr) {
+      console.error("Telegram alert bhejte waqt error:", alertErr.message);
+    }
+
+    res.status(201).json({ message: "Payment successful! Order confirm ho gaya.", order });
+  } catch (err) {
+    res.status(500).json({ message: "Payment verify karte waqt error", error: err.message });
+  }
+});
+// ---------- CASHFREE VERIFY (LOGIN REQUIRED) ----------
+app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
+  try {
+    const { orderId } = req.body;
+    if (!orderId) {
+      return res.status(400).json({ message: "orderId zaroori hai." });
+    }
+
+    const cfOrder = await cashfreeClient.PGFetchOrder(orderId);
+    if (cfOrder.data.order_status !== "PAID") {
+      return res.status(400).json({ message: `Payment abhi confirm nahi hua (status: ${cfOrder.data.order_status}).` });
+    }
+
+    const pending = await PendingPayment.findOne({ cfOrderId: orderId });
+    if (!pending) {
+      return res.status(404).json({ message: "Payment record nahi mila ya expire ho gaya." });
+    }
+    if (pending.user.toString() !== req.userId) {
+      return res.status(403).json({ message: "Ye payment aapki nahi hai." });
+    }
+
+    let cfPaymentId;
+    try {
+      const payments = await cashfreeClient.PGOrderFetchPayments(orderId);
+      const success = payments.data?.find((p) => p.payment_status === "SUCCESS");
+      cfPaymentId = success?.cf_payment_id;
+    } catch (e) {
+      console.warn("Cashfree payment id fetch nahi ho paya:", e.message);
+    }
+
+    const order = await Order.create({
+      user: pending.user,
+      planName: pending.planName,
+      category: pending.category,
+      vpsId: pending.vpsId,
+      nameOrIp: pending.nameOrIp,
+      ram: pending.ram,
+      price: pending.price,
+      couponCode: pending.couponCode,
+      discountAmount: pending.discountAmount,
+      finalAmount: pending.finalAmount,
+      status: "pending",
+      cfOrderId: orderId,
+      cfPaymentId,
+      paymentGateway: "cashfree",
+      paymentStatus: "paid",
+    });
+
+    if (pending.couponCode) {
+      await Coupon.updateOne({ code: pending.couponCode }, { $inc: { usedCount: 1 } });
+    }
+    await PendingPayment.deleteOne({ _id: pending._id });
+
     try {
       const orderedByUser = await User.findById(order.user).select("name email");
       sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
