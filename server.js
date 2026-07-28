@@ -201,6 +201,7 @@ const orderSchema = new mongoose.Schema(
     razorpayPaymentId: { type: String },
     cfOrderId: { type: String },
 cfPaymentId: { type: String },
+paymentGateway: { type: String, enum: ["razorpay", "cashfree"], default: "razorpay" },
     paymentStatus: { type: String, default: "paid" }, // order sirf tabhi banta hai jab payment verify ho jaye
     // ---- delivery details (admin fill karega jab VPS actually deliver kare) ----
     deliveryIp: { type: String },
