@@ -220,6 +220,10 @@ paymentGateway: { type: String, enum: ["razorpay", "cashfree"], default: "razorp
     deliveredAt: { type: Date },
     validityDays: { type: Number, default: 30 }, // kitne din ka plan hai
     expiresAt: { type: Date }, // deliveredAt + validityDays se calculate hota hai
+    // ---- Format/Reinstall request tracking ----
+    formatStatus: { type: String, enum: ["none", "pending"], default: "none" },
+    formatRequestedAt: { type: Date },
+    lastFormattedAt: { type: Date },
   },
   { timestamps: true }
 );
@@ -989,6 +993,54 @@ app.get("/api/vps/my-orders", protect, async (req, res) => {
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
+// ---------- FORMAT REQUEST BHEJO (LOGIN REQUIRED) ----------
+// User apne active/delivered VPS ke liye format/reinstall request bhejta hai
+app.post("/api/vps/request-format", protect, async (req, res) => {
+  try {
+    const { orderId } = req.body;
+    if (!orderId) {
+      return res.status(400).json({ message: "Order ID zaroori hai." });
+    }
+
+    const order = await Order.findOne({ _id: orderId, user: req.userId });
+    if (!order) {
+      return res.status(404).json({ message: "Order nahi mila." });
+    }
+
+    if (order.status !== "delivered" && order.status !== "active") {
+      return res.status(400).json({ message: "Ye order abhi active nahi hai." });
+    }
+
+    if (order.formatStatus === "pending") {
+      return res.status(400).json({ message: "Aapka pichla format request already pending hai. Admin approve karne ka wait karo." });
+    }
+
+    order.formatStatus = "pending";
+    order.formatRequestedAt = new Date();
+    await order.save();
+
+    try {
+      const user = await User.findById(req.userId);
+      const msg = [
+        `🔄 <b>Naya Format Request!</b>`,
+        ``,
+        `👤 <b>User:</b> ${user?.name || "Unknown"}`,
+        `📧 <b>Email:</b> ${user?.email || "Unknown"}`,
+        `🌐 <b>Plan/IP:</b> ${order.nameOrIp || order.planName}`,
+        `🆔 <b>Order ID:</b> <code>${order._id}</code>`,
+        ``,
+        `⚠️ <b>Admin Action Required:</b> Format karke Approve karo.`
+      ].join("\n");
+      sendTelegramMessage(msg);
+    } catch (alertErr) {
+      console.error("Telegram alert error:", alertErr.message);
+    }
+
+    res.json({ message: "Format request bheji gayi! Admin jald hi process karega." });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
 // ==================== SOFTWARE ROUTES (PUBLIC) ====================
 app.get("/api/software", async (req, res) => {
   try {
@@ -1184,6 +1236,34 @@ app.delete("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
       return res.status(404).json({ message: "Order nahi mila." });
     }
     res.json({ message: "Order delete ho gaya." });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+// ---------- ADMIN: SAARE PENDING FORMAT REQUESTS DEKHO ----------
+app.get("/api/admin/format-requests", protect, isAdmin, async (req, res) => {
+  try {
+    const requests = await Order.find({ formatStatus: "pending" })
+      .populate("user", "name email phone")
+      .sort({ formatRequestedAt: -1 });
+    res.json(requests);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ---------- ADMIN: FORMAT REQUEST APPROVE KARO ----------
+app.put("/api/admin/format-requests/:id/approve", protect, isAdmin, async (req, res) => {
+  try {
+    const order = await Order.findByIdAndUpdate(
+      req.params.id,
+      { formatStatus: "none", lastFormattedAt: new Date() },
+      { new: true }
+    );
+    if (!order) {
+      return res.status(404).json({ message: "Order nahi mila." });
+    }
+    res.json({ message: "Format request approve ho gayi!", order });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
