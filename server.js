@@ -1050,6 +1050,15 @@ app.get("/api/software", async (req, res) => {
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
+app.get("/api/software/my-orders", protect, async (req, res) => {
+  try {
+    const orders = await SoftwareOrder.find({ user: req.userId })
+      .sort({ createdAt: -1 });
+    res.json(orders);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
 
 app.get("/api/software/:id", async (req, res) => {
   try {
@@ -1161,15 +1170,7 @@ app.post("/api/software/verify-payment", protect, async (req, res) => {
   }
 });
 
-app.get("/api/software/my-orders", protect, async (req, res) => {
-  try {
-    const orders = await SoftwareOrder.find({ user: req.userId })
-      .sort({ createdAt: -1 });
-    res.json(orders);
-  } catch (err) {
-    res.status(500).json({ message: "Server error", error: err.message });
-  }
-});
+
 
 // ==================== ADMIN ROUTES ====================
 
