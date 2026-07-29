@@ -325,6 +325,7 @@ const softwareOrderSchema = new mongoose.Schema(
     upiPaymentStatus: { type: String, default: "pending" },
     deliveryFileUrl: { type: String },
     deliveryNotes: { type: String },
+    licenseKey: { type: String },
     deliveredAt: { type: Date },
   },
   { timestamps: true }
@@ -1446,13 +1447,14 @@ app.get("/api/admin/software-orders", isSoftwareAdmin, async (req, res) => {
 
 app.put("/api/admin/software-orders/:id", isSoftwareAdmin, async (req, res) => {
   try {
-    const { status, upiPaymentStatus, deliveryFileUrl, deliveryNotes } = req.body;
+    const { status, upiPaymentStatus, deliveryFileUrl, deliveryNotes, licenseKey } = req.body;
 
     const updateFields = {};
     if (status !== undefined) updateFields.status = status;
     if (upiPaymentStatus !== undefined) updateFields.upiPaymentStatus = upiPaymentStatus;
     if (deliveryFileUrl !== undefined) updateFields.deliveryFileUrl = deliveryFileUrl;
     if (deliveryNotes !== undefined) updateFields.deliveryNotes = deliveryNotes;
+    if (licenseKey !== undefined) updateFields.licenseKey = licenseKey;
 
     if (status === "delivered" || upiPaymentStatus === "paid") {
       updateFields.deliveredAt = new Date();
