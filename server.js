@@ -224,6 +224,9 @@ paymentGateway: { type: String, enum: ["razorpay", "cashfree"], default: "razorp
     formatStatus: { type: String, enum: ["none", "pending"], default: "none" },
     formatRequestedAt: { type: Date },
     lastFormattedAt: { type: Date },
+    formatReason: { type: String },
+formatSolution: { type: String },
+formatSeenByUser: { type: Boolean, default: true },
   },
   { timestamps: true }
 );
@@ -997,9 +1000,12 @@ app.get("/api/vps/my-orders", protect, async (req, res) => {
 // User apne active/delivered VPS ke liye format/reinstall request bhejta hai
 app.post("/api/vps/request-format", protect, async (req, res) => {
   try {
-    const { orderId } = req.body;
+    const { orderId, reason } = req.body;
     if (!orderId) {
       return res.status(400).json({ message: "Order ID zaroori hai." });
+    }
+    if (!reason || !reason.trim()) {
+      return res.status(400).json({ message: "Problem likhna zaroori hai." });
     }
 
     const order = await Order.findOne({ _id: orderId, user: req.userId });
@@ -1017,6 +1023,8 @@ app.post("/api/vps/request-format", protect, async (req, res) => {
 
     order.formatStatus = "pending";
     order.formatRequestedAt = new Date();
+    order.formatReason = reason.trim();
+    order.formatSeenByUser = true;
     await order.save();
 
     try {
@@ -1028,6 +1036,7 @@ app.post("/api/vps/request-format", protect, async (req, res) => {
         `📧 <b>Email:</b> ${user?.email || "Unknown"}`,
         `🌐 <b>Plan/IP:</b> ${order.nameOrIp || order.planName}`,
         `🆔 <b>Order ID:</b> <code>${order._id}</code>`,
+        `📝 <b>Problem:</b> ${escapeHtml(reason.trim())}`,
         ``,
         `⚠️ <b>Admin Action Required:</b> Format karke Approve karo.`
       ].join("\n");
@@ -1256,15 +1265,38 @@ app.get("/api/admin/format-requests", protect, isAdmin, async (req, res) => {
 // ---------- ADMIN: FORMAT REQUEST APPROVE KARO ----------
 app.put("/api/admin/format-requests/:id/approve", protect, isAdmin, async (req, res) => {
   try {
+    const { solution } = req.body;
+    if (!solution || !solution.trim()) {
+      return res.status(400).json({ message: "Solution likhna zaroori hai." });
+    }
+
     const order = await Order.findByIdAndUpdate(
       req.params.id,
-      { formatStatus: "none", lastFormattedAt: new Date() },
+      {
+        formatStatus: "none",
+        lastFormattedAt: new Date(),
+        formatSolution: solution.trim(),
+        formatSeenByUser: false,
+      },
       { new: true }
     );
     if (!order) {
       return res.status(404).json({ message: "Order nahi mila." });
     }
     res.json({ message: "Format request approve ho gayi!", order });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+app.put("/api/vps/orders/:id/ack-format", protect, async (req, res) => {
+  try {
+    const order = await Order.findOne({ _id: req.params.id, user: req.userId });
+    if (!order) {
+      return res.status(404).json({ message: "Order nahi mila." });
+    }
+    order.formatSeenByUser = true;
+    await order.save();
+    res.json({ message: "ok" });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
