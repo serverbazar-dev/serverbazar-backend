@@ -1265,19 +1265,25 @@ app.get("/api/admin/format-requests", protect, isAdmin, async (req, res) => {
 // ---------- ADMIN: FORMAT REQUEST APPROVE KARO ----------
 app.put("/api/admin/format-requests/:id/approve", protect, isAdmin, async (req, res) => {
   try {
-    const { solution } = req.body;
+    const { solution, deliveryIp, deliveryUsername, deliveryPassword, deliveryOS } = req.body;
     if (!solution || !solution.trim()) {
       return res.status(400).json({ message: "Solution likhna zaroori hai." });
     }
 
+    const updateFields = {
+      formatStatus: "none",
+      lastFormattedAt: new Date(),
+      formatSolution: solution.trim(),
+      formatSeenByUser: false,
+    };
+    if (deliveryIp !== undefined && deliveryIp.trim()) updateFields.deliveryIp = deliveryIp.trim();
+    if (deliveryUsername !== undefined && deliveryUsername.trim()) updateFields.deliveryUsername = deliveryUsername.trim();
+    if (deliveryPassword !== undefined && deliveryPassword.trim()) updateFields.deliveryPassword = deliveryPassword.trim();
+    if (deliveryOS !== undefined && deliveryOS.trim()) updateFields.deliveryOS = deliveryOS.trim();
+
     const order = await Order.findByIdAndUpdate(
       req.params.id,
-      {
-        formatStatus: "none",
-        lastFormattedAt: new Date(),
-        formatSolution: solution.trim(),
-        formatSeenByUser: false,
-      },
+      updateFields,
       { new: true }
     );
     if (!order) {
