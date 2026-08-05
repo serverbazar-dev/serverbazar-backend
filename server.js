@@ -49,7 +49,6 @@ const connectDB = async () => {
     process.exit(1);
   }
 };
-connectDB();
 
 // ==================== ADMIN AUTO-SEED ====================
 async function seedAdmin() {
@@ -303,6 +302,7 @@ const noticeSchema = new mongoose.Schema(
   { timestamps: true }
 );
 const Notice = mongoose.model("Notice", noticeSchema);
+noticeSchema.index({ active: 1, category: 1, createdAt: -1 });
 // ==================== SOFTWARE SCHEMAS ====================
 const softwareSchema = new mongoose.Schema(
   {
@@ -1627,7 +1627,7 @@ app.get("/api/notices", async (req, res) => {
     
     const notices = await Notice.find(filter)
       .sort({ createdAt: -1 })
-      .limit(10);
+      .limit(10).lean();
     
     res.json(notices);
   } catch (err) {
@@ -1795,4 +1795,8 @@ app.post("/api/upi/verify-payment", protect, async (req, res) => {
 
 // ==================== SERVER START ====================
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server chal raha hai port ${PORT} par`));
+const startServer = async () => {
+  await connectDB();
+  app.listen(PORT, () => console.log(`Server chal raha hai port ${PORT} par`));
+};
+startServer();
