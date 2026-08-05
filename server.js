@@ -737,7 +737,8 @@ app.post("/api/coupons/validate", protect, async (req, res) => {
 // Ye order KHUD nahi banata — sirf Razorpay order banata hai aur pending record save karta hai
 app.post("/api/vps/create-payment", protect, async (req, res) => {
   try {
-    const { vpsId, ram, couponCode, category } = req.body;
+    const { vpsId, ram, couponCode, category, gateway } = req.body;
+    const selectedGateway = (gateway === "cashfree" || gateway === "razorpay") ? gateway : ACTIVE_GATEWAY;
     const cat = category === "linux" ? "linux" : "vps";
 
     const plan = await VpsPlan.findOne({ vpsId, category: cat });
@@ -767,7 +768,7 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
       appliedCouponCode = result.coupon.code;
     }
 
-    if (ACTIVE_GATEWAY === "cashfree") {
+    if (selectedGateway === "cashfree") {
       const user = await User.findById(req.userId);
       const cfOrderId = `sb_${vpsId}_${Date.now()}`;
 
