@@ -709,6 +709,40 @@ app.put("/api/auth/change-password", protect, async (req, res) => {
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
+app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
+  try {
+    const { email, phone, newPassword } = req.body;
+
+    if (!email || !phone || !newPassword) {
+      return res.status(400).json({ message: "Email, phone aur naya password sab bharo." });
+    }
+    if (typeof email !== "string" || typeof phone !== "string" || typeof newPassword !== "string") {
+      return res.status(400).json({ message: "Invalid input format." });
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({ message: "Naya password kam se kam 6 characters ka hona chahiye." });
+    }
+
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    const genericFail = "Email ya phone number match nahi hua.";
+
+    if (!user || !user.phone) {
+      return res.status(400).json({ message: genericFail });
+    }
+
+    const normalize = (p) => String(p).replace(/[^0-9]/g, "").slice(-10);
+    if (normalize(user.phone) !== normalize(phone)) {
+      return res.status(400).json({ message: genericFail });
+    }
+
+    user.password = await bcrypt.hash(newPassword, 10);
+    await user.save();
+
+    res.json({ message: "Password successfully reset ho gaya! Ab login karo." });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
 
 // ==================== VPS / LINUX PLAN ROUTES ====================
 // Dono categories ("vps" aur "linux") same routes use karte hain, sirf ?category= query se filter hota hai.
