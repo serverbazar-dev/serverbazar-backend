@@ -8,6 +8,7 @@ const crypto = require("crypto");
 const https = require("https");
 const Razorpay = require("razorpay");
 const fetch = require("node-fetch");
+const rateLimit = require("express-rate-limit");
 
 dotenv.config();
 
@@ -113,8 +114,40 @@ async function getVmOverviewCached() {
 // ==================== END HOSTHEAVEN CONFIG ====================
 
 const app = express();
-app.use(cors());
+
+const allowedOrigins = [
+  "https://serverbazar.com",
+  "https://www.serverbazar.com",
+  "https://serverbazar.web.app",
+  "https://serverbazar.firebaseapp.com"
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Postman jaise tools origin nahi bhejte — unhe allow ya block karna tumhari marzi
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error("CORS blocked: is domain se access nahi hai."));
+  },
+  credentials: true,
+}));
+
 app.use(express.json());
+// Login/Register ke liye limiter — 15 min me max 10 tries per IP
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { message: "Bahut zyada attempts ho gaye. 15 minute baad try karo." },
+});
+
+// Coupon check karne ke liye limiter — thoda loose, kyunki genuine user retry karega
+const couponLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  message: { message: "Bahut zyada coupon attempts. Thodi der baad try karo." },
+});
 
 // ==================== RAZORPAY INSTANCE ====================
 // .env me RAZORPAY_KEY_ID aur RAZORPAY_KEY_SECRET set karo (secret sirf backend me, KABHI frontend me nahi)
@@ -539,12 +572,16 @@ async function checkCouponValidity(code, price, userId) {
 
 // ==================== AUTH ROUTES ====================
 
-app.post("/api/auth/register", async (req, res) => {
+app.post("/api/auth/register", authLimiter, async (req, res) => {
   try {
     const { name, email, password, phone } = req.body;
 
     if (!name || !email || !password) {
       return res.status(400).json({ message: "Sab fields bharo." });
+    }
+    // ✅ YE LINE ADD KARO
+    if (typeof email !== "string" || typeof password !== "string" || typeof name !== "string") {
+      return res.status(400).json({ message: "Invalid input format." });
     }
 
     const existingUser = await User.findOne({ email });
@@ -580,11 +617,16 @@ app.post("/api/auth/register", async (req, res) => {
   }
 });
 
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    const user = await User.findOne({ email });
+    // ✅ NAYA CHECK — sirf text allow karo, object/array nahi
+    if (typeof email !== "string" || typeof password !== "string") {
+      return res.status(400).json({ message: "Email ya password galat format me hai." });
+    }
+
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
     if (!user) {
       return res.status(400).json({ message: "Email ya password galat hai." });
     }
@@ -686,7 +728,7 @@ app.get("/api/vps/plans", async (req, res) => {
 // Modal me "Apply" button dabane par ye call hoga — payment shuru karne se pehle
 // discount preview dikhane ke liye. Ye order create NAHI karta, sirf check karta hai.
 // Body: { code, vpsId, ram, category }
-app.post("/api/coupons/validate", protect, async (req, res) => {
+app.post("/api/coupons/validate", couponLimiter, protect, async (req, res) => {
   try {
     const { code, vpsId, ram, category } = req.body;
     const cat = category === "linux" ? "linux" : "vps";
@@ -858,14 +900,35 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
     }
 
     // Pending record dhundo jo humne create-payment step me banaya tha
-    const pending = await PendingPayment.findOne({ razorpayOrderId: razorpay_order_id });
+    const pending = await PendingPayment.findOneAndDelete({ razorpayOrderId: razorpay_order_id });
     if (!pending) {
-      return res.status(404).json({ message: "Payment record nahi mila ya expire ho gaya." });
+      return res.status(404).json({ message: "Payment record nahi mila ya already process ho chuka hai." });
     }
 
     // Security: jisne payment shuru ki thi, wahi verify kar sakta hai
     if (pending.user.toString() !== req.userId) {
       return res.status(403).json({ message: "Ye payment aapki nahi hai." });
+    }
+        // ✅ EXTRA CHECK — Razorpay ke apne server se seedha confirm karo
+    // ki ye payment sach me successful hai aur sahi amount ka hai
+    let razorpayPaymentDetails;
+    try {
+      razorpayPaymentDetails = await razorpay.payments.fetch(razorpay_payment_id);
+    } catch (fetchErr) {
+      return res.status(400).json({ message: "Payment details Razorpay se verify nahi ho paye." });
+    }
+
+    if (razorpayPaymentDetails.status !== "captured") {
+      return res.status(400).json({ message: `Payment abhi captured nahi hua (status: ${razorpayPaymentDetails.status}).` });
+    }
+
+    if (razorpayPaymentDetails.order_id !== razorpay_order_id) {
+      return res.status(400).json({ message: "Payment kisi aur order ka hai." });
+    }
+
+    const expectedAmountInPaise = Math.round(pending.finalAmount * 100);
+    if (razorpayPaymentDetails.amount !== expectedAmountInPaise) {
+      return res.status(400).json({ message: "Payment amount match nahi hua." });
     }
 
     // Ab jaake asli Order banega — payment success confirm hone ke baad
@@ -891,8 +954,7 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
       await Coupon.updateOne({ code: pending.couponCode }, { $inc: { usedCount: 1 } });
     }
 
-    await PendingPayment.deleteOne({ _id: pending._id });
-
+  
     // ---- Telegram alert: admin ko turant naya order notify karo ----
     // Ye fire-and-forget hai — Telegram fail bhi ho jaye to order response par asar nahi padega.
     try {
@@ -920,10 +982,16 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
       return res.status(400).json({ message: `Payment abhi confirm nahi hua (status: ${cfOrder.data.order_status}).` });
     }
 
-    const pending = await PendingPayment.findOne({ cfOrderId: orderId });
+     const pending = await PendingPayment.findOneAndDelete({ cfOrderId: orderId });
     if (!pending) {
-      return res.status(404).json({ message: "Payment record nahi mila ya expire ho gaya." });
+      return res.status(404).json({ message: "Payment record nahi mila ya already process ho chuka hai." });
     }
+
+    // ✅ EXTRA CHECK — amount match karo
+    if (Number(cfOrder.data.order_amount) !== Number(pending.finalAmount)) {
+      return res.status(400).json({ message: "Payment amount match nahi hua." });
+    }
+
     if (pending.user.toString() !== req.userId) {
       return res.status(403).json({ message: "Ye payment aapki nahi hai." });
     }
@@ -958,8 +1026,7 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
     if (pending.couponCode) {
       await Coupon.updateOne({ code: pending.couponCode }, { $inc: { usedCount: 1 } });
     }
-    await PendingPayment.deleteOne({ _id: pending._id });
-
+    
     try {
       const orderedByUser = await User.findById(order.user).select("name email");
       sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
