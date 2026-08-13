@@ -7,6 +7,7 @@ const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
 const https = require("https");
 const Razorpay = require("razorpay");
+const fetch = require("node-fetch");
 
 dotenv.config();
 
@@ -17,6 +18,99 @@ let cashfreeClient = new Cashfree(
   process.env.CASHFREE_CLIENT_SECRET
 );
 const ACTIVE_GATEWAY = (process.env.PAYMENT_GATEWAY || "razorpay").toLowerCase();
+// ==================== HOSTHEAVEN CONFIG ====================
+const HOSTHEAVEN_BASE = "https://vps.hostheaven.in";
+const HOSTHEAVEN_EMAIL = process.env.HOSTHEAVEN_EMAIL;
+const HOSTHEAVEN_PASSWORD = process.env.HOSTHEAVEN_PASSWORD;
+const RESELLER_DOMAIN = process.env.HOSTHEAVEN_RESELLER_DOMAIN;
+
+let hostHeavenToken = null;
+let hostHeavenUserId = null;
+let tokenRefreshing = false;
+let tokenRefreshPromise = null;
+
+const hhRequestQueue = [];
+let hhRequestRunning = false;
+
+async function processHHQueue() {
+  if (hhRequestRunning || hhRequestQueue.length === 0) return;
+  hhRequestRunning = true;
+  const { endpoint, method, body, resolve, reject } = hhRequestQueue.shift();
+  try {
+    resolve(await hostHeavenAPIDirect(endpoint, method, body));
+  } catch (err) {
+    reject(err);
+  } finally {
+    hhRequestRunning = false;
+    setTimeout(processHHQueue, 500);
+  }
+}
+
+async function hostHeavenAPIDirect(endpoint, method = "GET", body = null) {
+  if (!hostHeavenToken) await getHostHeavenToken();
+  const headers = {
+    "Content-Type": "application/json",
+    "Authorization": `Bearer ${hostHeavenToken}`,
+    "X-Reseller-Domain": RESELLER_DOMAIN,
+  };
+  const opts = { method, headers };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(`${HOSTHEAVEN_BASE}${endpoint}`, opts);
+  if (res.status === 401 || res.status === 403) {
+    hostHeavenToken = null;
+    await getHostHeavenToken();
+    const headers2 = { ...headers, Authorization: `Bearer ${hostHeavenToken}` };
+    const opts2 = { method, headers: headers2 };
+    if (body) opts2.body = JSON.stringify(body);
+    return (await fetch(`${HOSTHEAVEN_BASE}${endpoint}`, opts2)).json();
+  }
+  return res.json();
+}
+
+function hostHeavenAPI(endpoint, method = "GET", body = null) {
+  return new Promise((resolve, reject) => {
+    hhRequestQueue.push({ endpoint, method, body, resolve, reject });
+    processHHQueue();
+  });
+}
+
+async function getHostHeavenToken() {
+  if (hostHeavenToken) return hostHeavenToken;
+  if (tokenRefreshing) return tokenRefreshPromise;
+  tokenRefreshing = true;
+  tokenRefreshPromise = (async () => {
+    try {
+      const res = await fetch(`${HOSTHEAVEN_BASE}/api/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Reseller-Domain": RESELLER_DOMAIN },
+        body: JSON.stringify({ email: HOSTHEAVEN_EMAIL, password: HOSTHEAVEN_PASSWORD }),
+      });
+      const data = await res.json();
+      hostHeavenToken = data.token;
+      try {
+        const payload = JSON.parse(Buffer.from(data.token.split(".")[1], "base64").toString());
+        hostHeavenUserId = payload.userId || payload.id || payload.sub;
+      } catch (e) {}
+      setTimeout(() => { hostHeavenToken = null; }, 50 * 60 * 1000);
+      return hostHeavenToken;
+    } finally {
+      tokenRefreshing = false;
+    }
+  })();
+  return tokenRefreshPromise;
+}
+
+let vmOverviewCache = null;
+let vmOverviewCacheTime = 0;
+async function getVmOverviewCached() {
+  const now = Date.now();
+  if (vmOverviewCache && now - vmOverviewCacheTime < 20000) return vmOverviewCache;
+  const data = await hostHeavenAPI("/api/users/orders/overview?page=0&size=10000");
+  vmOverviewCache = data;
+  vmOverviewCacheTime = now;
+  return data;
+}
+// ==================== END HOSTHEAVEN CONFIG ====================
 
 const app = express();
 app.use(cors());
@@ -217,6 +311,7 @@ paymentGateway: { type: String, enum: ["razorpay", "cashfree"], default: "razorp
     formatReason: { type: String },
 formatSolution: { type: String },
 formatSeenByUser: { type: Boolean, default: true },
+vmId: { type: Number, default: null },
   },
   { timestamps: true }
 );
@@ -946,7 +1041,136 @@ app.post("/api/vps/request-format", protect, async (req, res) => {
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
+// ==================== HOSTHEAVEN ROUTES (USER) ====================
+async function findOwnedOrderByVmId(userId, vmId) {
+  return Order.findOne({ user: userId, vmId: Number(vmId) });
+}
+
+app.get("/api/vps/my-hostheaven-vps", protect, async (req, res) => {
+  try {
+    const orders = await Order.find({ user: req.userId, vmId: { $ne: null } });
+    if (!orders.length) return res.json({ success: true, vms: [] });
+    const allVms = await getVmOverviewCached();
+    const orderVmIds = orders.map(o => Number(o.vmId));
+    const vms = (allVms.orders || [])
+      .filter(v => orderVmIds.includes(Number(v.vmId)))
+      .map(v => {
+        const o = orders.find(x => Number(x.vmId) === Number(v.vmId));
+        return { ...v, deliveryPassword: o.deliveryPassword, orderId: o._id, planName: o.nameOrIp || o.planName };
+      });
+    res.json({ success: true, vms });
+  } catch (err) {
+    res.json({ success: false, vms: [], message: err.message });
+  }
+});
+
+app.post("/api/vps/hostheaven-control", protect, async (req, res) => {
+  try {
+    const { vmId, action } = req.body;
+    const order = await findOwnedOrderByVmId(req.userId, vmId);
+    if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
+    const data = await hostHeavenAPI(`/api/users/${hostHeavenUserId}/vms/${vmId}/control?action=${action}`, "POST", {});
+    res.json({ success: true, data });
+  } catch (err) {
+    res.json({ success: false, message: err.message });
+  }
+});
+
+app.post("/api/vps/hostheaven-change-password", protect, async (req, res) => {
+  try {
+    const { vmId, newPassword } = req.body;
+    const order = await findOwnedOrderByVmId(req.userId, vmId);
+    if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
+    const tok = await getHostHeavenToken();
+    const result = await fetch(`${HOSTHEAVEN_BASE}/api/users/${hostHeavenUserId}/vms/${vmId}/password`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok}`, "X-Reseller-Domain": RESELLER_DOMAIN },
+      body: JSON.stringify({ password: newPassword }),
+    });
+    const data = await result.json();
+    order.deliveryPassword = newPassword;
+    await order.save();
+    res.json({ success: true, data });
+  } catch (err) {
+    res.json({ success: false, message: err.message });
+  }
+});
+
+app.get("/api/vps/hostheaven-isos/:vmId", protect, async (req, res) => {
+  try {
+    const { vmId } = req.params;
+    const order = await findOwnedOrderByVmId(req.userId, vmId);
+    if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
+    const vmDetails = await hostHeavenAPI(`/api/users/orders/${vmId}/details`);
+    const zoneId = vmDetails.zoneId;
+    const isos = await hostHeavenAPI(`/api/users/zones/${zoneId}/isos`);
+    res.json({ success: true, isos, zoneId });
+  } catch (err) {
+    res.json({ success: false, isos: [], message: err.message });
+  }
+});
+
+const rebuildInProgress = new Set();
+app.post("/api/vps/hostheaven-rebuild", protect, async (req, res) => {
+  try {
+    const { vmId, isoId } = req.body;
+    const order = await findOwnedOrderByVmId(req.userId, vmId);
+    if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
+    if (rebuildInProgress.has(String(vmId))) {
+      return res.json({ success: false, message: "Rebuild already chal rahi hai, thodi der wait karo." });
+    }
+    rebuildInProgress.add(String(vmId));
+    const vmDetails = await hostHeavenAPI(`/api/users/orders/${vmId}/details`);
+    const zoneId = vmDetails.zoneId;
+    const zoneIsos = await hostHeavenAPI(`/api/users/zones/${zoneId}/isos`);
+    const validIso = zoneIsos.find(iso => iso.id === Number(isoId));
+    if (!validIso) {
+      rebuildInProgress.delete(String(vmId));
+      return res.json({ success: false, message: `Selected OS zone ke liye valid nahi. Valid: ${zoneIsos.map(i => i.name).join(", ")}` });
+    }
+    const tok = await getHostHeavenToken();
+    const result = await fetch(`${HOSTHEAVEN_BASE}/api/users/${hostHeavenUserId}/vms/${vmId}/rebuild?isoId=${validIso.id}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok}`, "X-Reseller-Domain": RESELLER_DOMAIN },
+      body: JSON.stringify({}),
+    });
+    const data = await result.json();
+    setTimeout(() => rebuildInProgress.delete(String(vmId)), 3 * 60 * 1000);
+    if (data.message === "Rebuild initiated.") {
+      res.json({ success: true, data });
+    } else {
+      rebuildInProgress.delete(String(vmId));
+      res.json({ success: false, message: data.message || "Failed" });
+    }
+  } catch (err) {
+    res.json({ success: false, message: err.message });
+  }
+});
+
+app.get("/api/vps/hostheaven-lock-status/:vmId", protect, async (req, res) => {
+  try {
+    const data = await hostHeavenAPI(`/api/vms/${req.params.vmId}/lock-status`);
+    const isLocked = data.isLocked || ["SUSPENDED", "LOCKED", "ERROR"].includes(data.status);
+    res.json({ success: true, isLocked, status: data.status || "" });
+  } catch (err) {
+    res.json({ success: false, isLocked: false });
+  }
+});
+
+app.get("/api/admin/hostheaven-live-vms", protect, isAdmin, async (req, res) => {
+  try {
+    const data = await getVmOverviewCached();
+    const vms = (data.orders || []).map(v => ({
+      vmId: v.vmId, ip: v.ipAddress, os: v.os || "", plan: v.serverPlan || "", status: v.liveState || "",
+    }));
+    res.json({ success: true, vms });
+  } catch (err) {
+    res.json({ success: false, message: err.message });
+  }
+});
+// ==================== END HOSTHEAVEN ROUTES ====================
 // ==================== ADMIN ROUTES ====================
+
 
 app.get("/api/admin/users", protect, isAdmin, async (req, res) => {
   try {
@@ -973,6 +1197,7 @@ app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
     const { status, deliveryIp, deliveryUsername, deliveryPassword, deliveryOS, validityDays } = req.body;
 
     const updateFields = {};
+    if (req.body.vmId !== undefined) updateFields.vmId = Number(req.body.vmId) || null;
     if (status !== undefined) updateFields.status = status;
     if (deliveryIp !== undefined) updateFields.deliveryIp = deliveryIp;
     if (deliveryUsername !== undefined) updateFields.deliveryUsername = deliveryUsername;
