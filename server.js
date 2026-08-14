@@ -383,6 +383,8 @@ const couponSchema = new mongoose.Schema(
     perUserLimit: { type: Number, default: 1 }, // ek user kitni baar use kar sakta hai
     expiresAt: { type: Date }, // null = kabhi expire nahi hoga
     active: { type: Boolean, default: true },
+    category: { type: String, enum: ["vps", "linux", "both"], default: "both" },
+    assignedToEmail: { type: String, lowercase: true, trim: true, default: null },
   },
   { timestamps: true }
 );
@@ -478,7 +480,7 @@ const SECRET_COUPON_PER_USER_LIMIT = 1; // har user isko sirf 1 baar use kar sak
 // Ek coupon code, plan price aur user ke against valid hai ya nahi check karta hai.
 // Ye function backend ke andar hi use hota hai (create-payment aur validate dono jagah)
 // taaki logic ek hi jagah rahe aur dono kabhi out-of-sync na ho.
-async function checkCouponValidity(code, price, userId) {
+async function checkCouponValidity(code, price, userId, category, userEmail) {
   if (!code) {
     return { valid: false, message: "Coupon code do." };
   }
@@ -517,6 +519,15 @@ async function checkCouponValidity(code, price, userId) {
 
   if (!coupon || !coupon.active) {
     return { valid: false, message: "Ye coupon code valid nahi hai." };
+  }
+  if (coupon.category && coupon.category !== "both" && coupon.category !== category) {
+    return { valid: false, message: "Ye coupon is category ke liye valid nahi hai." };
+  }
+
+  if (coupon.assignedToEmail) {
+    if (!userEmail || coupon.assignedToEmail !== userEmail.toLowerCase().trim()) {
+      return { valid: false, message: "Ye coupon code valid nahi hai." };
+    }
   }
 
   if (coupon.expiresAt && new Date() > coupon.expiresAt) {
@@ -781,7 +792,8 @@ app.post("/api/coupons/validate", couponLimiter, protect, async (req, res) => {
       return res.status(400).json({ message: "Ye RAM option is plan me nahi hai." });
     }
 
-    const result = await checkCouponValidity(code, selectedOption.price, req.userId);
+    const currentUser = await User.findById(req.userId).select("email");
+    const result = await checkCouponValidity(code, selectedOption.price, req.userId, cat, currentUser?.email);
 
     if (!result.valid) {
       return res.status(400).json({ message: result.message });
@@ -818,14 +830,17 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
       return res.status(400).json({ message: "Ye RAM option is plan me nahi hai." });
     }
 
+    const user = await User.findById(req.userId);
+
     let discountAmount = 0;
     let finalAmount = selectedOption.price;
     let appliedCouponCode = undefined;
 
     // Coupon bheja gaya hai to server khud se dobara validate karega
     // (frontend ka discount kabhi trust nahi karna, warna koi bhi manually price ghata sakta hai)
+    
     if (couponCode) {
-      const result = await checkCouponValidity(couponCode, selectedOption.price, req.userId);
+      const result = await checkCouponValidity(couponCode, selectedOption.price, req.userId, cat, user?.email);
       if (!result.valid) {
         return res.status(400).json({ message: result.message });
       }
@@ -835,7 +850,7 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
     }
 
     if (selectedGateway === "cashfree") {
-      const user = await User.findById(req.userId);
+      
       const cfOrderId = `sb_${vpsId}_${Date.now()}`;
 
       const cfOrder = await cashfreeClient.PGCreateOrder({
@@ -1498,6 +1513,7 @@ app.post("/api/admin/coupons", protect, isAdmin, async (req, res) => {
     const {
       code, discountType, discountValue, maxDiscountAmount,
       minOrderAmount, usageLimit, perUserLimit, expiresAt, active,
+      category, assignedToEmail,
     } = req.body;
 
     if (!code || !discountType || !discountValue) {
@@ -1519,6 +1535,8 @@ app.post("/api/admin/coupons", protect, isAdmin, async (req, res) => {
       perUserLimit,
       expiresAt,
       active: active !== undefined ? !!active : true,
+      category: (category === "vps" || category === "linux") ? category : "both",
+      assignedToEmail: assignedToEmail ? assignedToEmail.trim().toLowerCase() : null,
     });
 
     res.status(201).json({ message: "Coupon add ho gaya!", coupon });
@@ -1532,6 +1550,7 @@ app.put("/api/admin/coupons/:id", protect, isAdmin, async (req, res) => {
     const {
       discountType, discountValue, maxDiscountAmount,
       minOrderAmount, usageLimit, perUserLimit, expiresAt, active,
+      category, assignedToEmail,
     } = req.body;
 
     const updateFields = {};
@@ -1543,6 +1562,8 @@ app.put("/api/admin/coupons/:id", protect, isAdmin, async (req, res) => {
     if (perUserLimit !== undefined) updateFields.perUserLimit = perUserLimit;
     if (expiresAt !== undefined) updateFields.expiresAt = expiresAt;
     if (active !== undefined) updateFields.active = active;
+    if (category !== undefined) updateFields.category = (category === "vps" || category === "linux") ? category : "both";
+    if (assignedToEmail !== undefined) updateFields.assignedToEmail = assignedToEmail ? assignedToEmail.trim().toLowerCase() : null;
 
     const coupon = await Coupon.findByIdAndUpdate(req.params.id, updateFields, { new: true });
     if (!coupon) {
