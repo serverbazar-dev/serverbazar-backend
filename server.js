@@ -444,6 +444,7 @@ const walletTransactionSchema = new mongoose.Schema(
     razorpayOrderId: { type: String },
     razorpayPaymentId: { type: String },
     orderId: { type: mongoose.Schema.Types.ObjectId, ref: "Order" }, // agar wallet se VPS khareeda
+    adminId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null }, // ✅ NAYA
     status: { type: String, enum: ["pending", "completed", "failed"], default: "completed" },
   },
   { timestamps: true }
@@ -1381,6 +1382,138 @@ app.get("/api/wallet/balance", protect, async (req, res) => {
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
+
+// ==================== ADMIN WALLET ROUTES ====================
+
+// Rate limit — galti se ya kisi script se bulk balance edit na ho paye
+const adminWalletLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  message: { message: "Bahut zyada wallet actions ho gaye. Thodi der baad try karo." },
+});
+
+// ---------- SAARE USERS KA WALLET BALANCE (LIST) ----------
+app.get("/api/admin/wallets", protect, isAdmin, async (req, res) => {
+  try {
+    const users = await User.find().select("name email phone").sort({ name: 1 });
+    const wallets = await Wallet.find();
+
+    const walletMap = {};
+    wallets.forEach((w) => { walletMap[w.user.toString()] = w.balance; });
+
+    const result = users.map((u) => ({
+      userId: u._id,
+      name: u.name,
+      email: u.email,
+      phone: u.phone || "",
+      balance: walletMap[u._id.toString()] || 0,
+    }));
+
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ---------- KISI EK USER KI TRANSACTION HISTORY ----------
+app.get("/api/admin/wallets/:userId/transactions", protect, isAdmin, async (req, res) => {
+  try {
+    const transactions = await WalletTransaction.find({ user: req.params.userId })
+      .populate("adminId", "name email")
+      .sort({ createdAt: -1 })
+      .limit(200);
+    res.json(transactions);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ---------- WALLET BALANCE MANUALLY ADJUST KARO (CREDIT / DEBIT) ----------
+// Body: { amount, type: "credit"|"debit", reason }
+// Security:
+//  - Amount hamesha positive number, type explicit "credit"/"debit" (sign-flip galti se na ho)
+//  - Reason MANDATORY hai — har admin action ka audit trail rahega
+//  - Debit tabhi hoga jab balance sufficient ho (negative balance allowed nahi)
+//  - Mongo transaction se balance update + log ek saath atomic hote hain
+//  - adminId save hota hai — pata chalega kis admin ne kab kya kiya
+app.put("/api/admin/wallets/:userId", protect, isAdmin, adminWalletLimiter, async (req, res) => {
+  try {
+    const { amount, type, reason } = req.body;
+    const numAmount = Number(amount);
+
+    if (!numAmount || numAmount <= 0 || !isFinite(numAmount)) {
+      return res.status(400).json({ message: "Amount ek valid positive number hona chahiye." });
+    }
+    if (!["credit", "debit"].includes(type)) {
+      return res.status(400).json({ message: "Type 'credit' ya 'debit' hi ho sakta hai." });
+    }
+    if (!reason || !reason.trim()) {
+      return res.status(400).json({ message: "Reason likhna zaroori hai (audit ke liye)." });
+    }
+
+    const targetUser = await User.findById(req.params.userId);
+    if (!targetUser) {
+      return res.status(404).json({ message: "User nahi mila." });
+    }
+
+    const session = await mongoose.startSession();
+    try {
+      session.startTransaction();
+
+      let wallet = await Wallet.findOne({ user: req.params.userId }).session(session);
+      if (!wallet) {
+        const created = await Wallet.create([{ user: req.params.userId, balance: 0 }], { session });
+        wallet = created[0];
+      }
+
+      if (type === "debit" && wallet.balance < numAmount) {
+        await session.abortTransaction();
+        session.endSession();
+        return res.status(400).json({ message: `User ka balance sirf ₹${wallet.balance} hai, itna debit nahi ho sakta.` });
+      }
+
+      wallet.balance += type === "credit" ? numAmount : -numAmount;
+      await wallet.save({ session });
+
+      await WalletTransaction.create([{
+        user: req.params.userId,
+        type,
+        amount: numAmount,
+        description: `Admin Adjustment: ${reason.trim()}`,
+        adminId: req.userId,
+        status: "completed",
+      }], { session });
+
+      await session.commitTransaction();
+      session.endSession();
+
+      // Fire-and-forget Telegram alert — koi bhi manual wallet edit turant log ho
+      try {
+        const admin = await User.findById(req.userId).select("name email");
+        sendTelegramMessage(
+          [
+            `⚙️ <b>Admin Wallet Adjustment</b>`,
+            ``,
+            `👤 <b>User:</b> ${escapeHtml(targetUser.name)} (${escapeHtml(targetUser.email)})`,
+            `🛠️ <b>Admin:</b> ${escapeHtml(admin?.name)} (${escapeHtml(admin?.email)})`,
+            `${type === "credit" ? "➕" : "➖"} <b>${type.toUpperCase()}:</b> ₹${numAmount}`,
+            `📝 <b>Reason:</b> ${escapeHtml(reason.trim())}`,
+            `💰 <b>Naya Balance:</b> ₹${wallet.balance}`,
+          ].join("\n")
+        );
+      } catch (e) {}
+
+      res.json({ message: "Wallet update ho gaya.", balance: wallet.balance });
+    } catch (err) {
+      await session.abortTransaction();
+      session.endSession();
+      throw err;
+    }
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+// ==================== END ADMIN WALLET ROUTES ====================
 
 // ---------- TRANSACTION HISTORY ----------
 app.get("/api/wallet/transactions", protect, async (req, res) => {
