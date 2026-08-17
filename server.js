@@ -327,7 +327,7 @@ const orderSchema = new mongoose.Schema(
     razorpayPaymentId: { type: String },
     cfOrderId: { type: String },
 cfPaymentId: { type: String },
-paymentGateway: { type: String, enum: ["razorpay", "cashfree"], default: "razorpay" },
+paymentGateway: { type: String, enum: ["razorpay", "cashfree", "wallet"], default: "razorpay" },
     paymentStatus: { type: String, default: "paid" }, // order sirf tabhi banta hai jab payment verify ho jaye
     // ---- delivery details (admin fill karega jab VPS actually deliver kare) ----
     deliveryIp: { type: String },
@@ -396,7 +396,7 @@ const pendingPaymentSchema = new mongoose.Schema(
   {
     razorpayOrderId: { type: String, unique: true, sparse: true },
 cfOrderId: { type: String, unique: true, sparse: true },
-paymentGateway: { type: String, enum: ["razorpay", "cashfree"], default: "razorpay" },
+paymentGateway: { type: String, enum: ["razorpay", "cashfree", "wallet"], default: "razorpay" },
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     vpsId: { type: String, required: true },
     nameOrIp: { type: String },
@@ -424,6 +424,32 @@ const noticeSchema = new mongoose.Schema(
 );
 const Notice = mongoose.model("Notice", noticeSchema);
 noticeSchema.index({ active: 1, category: 1, createdAt: -1 });
+
+// ==================== WALLET SCHEMAS ====================
+const walletSchema = new mongoose.Schema(
+  {
+    user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, unique: true },
+    balance: { type: Number, default: 0 },
+  },
+  { timestamps: true }
+);
+const Wallet = mongoose.model("Wallet", walletSchema);
+
+const walletTransactionSchema = new mongoose.Schema(
+  {
+    user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    type: { type: String, enum: ["credit", "debit", "refund"], required: true },
+    amount: { type: Number, required: true },
+    description: { type: String, default: "" },
+    razorpayOrderId: { type: String },
+    razorpayPaymentId: { type: String },
+    orderId: { type: mongoose.Schema.Types.ObjectId, ref: "Order" }, // agar wallet se VPS khareeda
+    status: { type: String, enum: ["pending", "completed", "failed"], default: "completed" },
+  },
+  { timestamps: true }
+);
+const WalletTransaction = mongoose.model("WalletTransaction", walletTransactionSchema);
+walletTransactionSchema.index({ razorpayPaymentId: 1 }, { unique: true, sparse: true });
 
 // ==================== MIDDLEWARE (auth check) ====================
 const protect = (req, res, next) => {
@@ -816,7 +842,7 @@ app.post("/api/coupons/validate", couponLimiter, protect, async (req, res) => {
 app.post("/api/vps/create-payment", protect, async (req, res) => {
   try {
     const { vpsId, ram, couponCode, category, gateway } = req.body;
-    const selectedGateway = (gateway === "cashfree" || gateway === "razorpay") ? gateway : ACTIVE_GATEWAY;
+    const selectedGateway = ["cashfree", "razorpay", "wallet"].includes(gateway) ? gateway : ACTIVE_GATEWAY;
     const cat = category === "linux" ? "linux" : "vps";
 
     const plan = await VpsPlan.findOne({ vpsId, category: cat });
@@ -847,6 +873,65 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
       discountAmount = result.discountAmount;
       finalAmount = result.finalAmount;
       appliedCouponCode = result.coupon.code;
+    }
+    if (selectedGateway === "wallet") {
+      const session = await mongoose.startSession();
+      try {
+        session.startTransaction();
+
+        const wallet = await Wallet.findOne({ user: req.userId }).session(session);
+        if (!wallet || wallet.balance < finalAmount) {
+          await session.abortTransaction();
+          session.endSession();
+          return res.status(400).json({ message: "Wallet me paise kam hain." });
+        }
+
+        wallet.balance -= finalAmount;
+        await wallet.save({ session });
+
+        const [order] = await Order.create([{
+          user: req.userId,
+          planName: plan.label || plan.nameOrIp,
+          category: cat,
+          vpsId: plan.vpsId,
+          nameOrIp: plan.nameOrIp,
+          ram: selectedOption.ram,
+          price: selectedOption.price,
+          couponCode: appliedCouponCode,
+          discountAmount,
+          finalAmount,
+          status: "pending",
+          paymentGateway: "wallet",
+          paymentStatus: "paid",
+        }], { session });
+
+        await WalletTransaction.create([{
+          user: req.userId,
+          type: "debit",
+          amount: finalAmount,
+          description: `VPS Purchase: ${plan.nameOrIp}`,
+          orderId: order._id,
+          status: "completed",
+        }], { session });
+
+        if (appliedCouponCode) {
+          await Coupon.updateOne({ code: appliedCouponCode }, { $inc: { usedCount: 1 } }).session(session);
+        }
+
+        await session.commitTransaction();
+        session.endSession();
+
+        try {
+          const orderedByUser = await User.findById(order.user).select("name email");
+          sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
+        } catch (e) {}
+
+        return res.status(201).json({ gateway: "wallet", message: "Wallet se payment ho gaya! Order confirm.", order });
+      } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        return res.status(500).json({ message: "Wallet payment fail ho gaya.", error: err.message });
+      }
     }
 
     if (selectedGateway === "cashfree") {
@@ -1285,6 +1370,136 @@ app.get("/api/admin/hostheaven-live-vms", protect, isAdmin, async (req, res) => 
   }
 });
 // ==================== END HOSTHEAVEN ROUTES ====================
+// ==================== WALLET ROUTES ====================
+
+// ---------- BALANCE DEKHO ----------
+app.get("/api/wallet/balance", protect, async (req, res) => {
+  try {
+    const wallet = await Wallet.findOne({ user: req.userId });
+    res.json({ balance: wallet ? wallet.balance : 0 });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ---------- TRANSACTION HISTORY ----------
+app.get("/api/wallet/transactions", protect, async (req, res) => {
+  try {
+    const transactions = await WalletTransaction.find({ user: req.userId })
+      .sort({ createdAt: -1 })
+      .limit(100);
+    res.json(transactions);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ---------- STEP 1: WALLET RECHARGE ORDER BANAO (Razorpay) ----------
+app.post("/api/wallet/create-recharge-order", protect, async (req, res) => {
+  try {
+    const { amount } = req.body;
+    const amt = Number(amount);
+
+    if (!amt || amt < 10) {
+      return res.status(400).json({ message: "Minimum ₹10 recharge karna hoga." });
+    }
+
+    const razorpayOrder = await razorpay.orders.create({
+      amount: Math.round(amt * 100),
+      currency: "INR",
+      receipt: `wallet_${req.userId}_${Date.now()}`,
+    });
+
+    res.json({
+      razorpayOrderId: razorpayOrder.id,
+      amount: razorpayOrder.amount,
+      currency: "INR",
+      keyId: process.env.RAZORPAY_KEY_ID,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Recharge order banane me error", error: err.message });
+  }
+});
+
+// ---------- STEP 2: PAYMENT VERIFY + BALANCE ADD ----------
+app.post("/api/wallet/verify-recharge", protect, async (req, res) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, amount } = req.body;
+
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !amount) {
+      return res.status(400).json({ message: "Payment details incomplete hain." });
+    }
+
+    // Signature verify
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest("hex");
+
+    if (expectedSignature !== razorpay_signature) {
+      return res.status(400).json({ message: "Signature match nahi hui." });
+    }
+
+    // Isi payment ID se pehle koi transaction already ban chuka to duplicate credit rok do
+    const alreadyDone = await WalletTransaction.findOne({ razorpayPaymentId: razorpay_payment_id });
+    if (alreadyDone) {
+      return res.status(400).json({ message: "Ye payment already process ho chuka hai." });
+    }
+
+    // Razorpay se direct confirm karo — amount aur status
+    let paymentDetails;
+    try {
+      paymentDetails = await razorpay.payments.fetch(razorpay_payment_id);
+    } catch (e) {
+      return res.status(400).json({ message: "Payment Razorpay se verify nahi ho paya." });
+    }
+
+    if (paymentDetails.status !== "captured") {
+      return res.status(400).json({ message: `Payment abhi captured nahi hua (status: ${paymentDetails.status}).` });
+    }
+    if (paymentDetails.order_id !== razorpay_order_id) {
+      return res.status(400).json({ message: "Payment kisi aur order ka hai." });
+    }
+
+    const expectedPaise = Math.round(Number(amount) * 100);
+    if (paymentDetails.amount !== expectedPaise) {
+      return res.status(400).json({ message: "Amount match nahi hua." });
+    }
+
+    // Pehle transaction record banao — unique index isko atomically duplicate hone se rokega.
+    // Agar ye create fail ho gaya (kyunki dusri request already same payment id use kar chuki hai),
+    // to balance ko haath mat lagao — isse double-credit fraud nahi ho sakta.
+    let transactionRecord;
+    try {
+      transactionRecord = await WalletTransaction.create({
+        user: req.userId,
+        type: "credit",
+        amount: Number(amount),
+        description: "Wallet Recharge",
+        razorpayOrderId: razorpay_order_id,
+        razorpayPaymentId: razorpay_payment_id,
+        status: "completed",
+      });
+    } catch (dupErr) {
+      if (dupErr.code === 11000) {
+        return res.status(400).json({ message: "Ye payment already process ho chuka hai." });
+      }
+      throw dupErr;
+    }
+
+    // Transaction record safal bana, ab hi balance add karo
+    const wallet = await Wallet.findOneAndUpdate(
+      { user: req.userId },
+      { $inc: { balance: Number(amount) } },
+      { new: true, upsert: true }
+    );
+
+    res.json({ message: "Wallet recharge ho gaya!", balance: wallet.balance });
+  } catch (err) {
+    res.status(500).json({ message: "Verify karte waqt error", error: err.message });
+  }
+});
+
 // ==================== ADMIN ROUTES ====================
 
 
