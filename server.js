@@ -273,7 +273,9 @@ async function setupProxyOnServer({ ip, username, password, proxyUsername, proxy
 
   if (installResult.code !== 0) {
     ssh.dispose();
-    throw new Error(`Squid install fail hua:\n${installResult.stderr}`);
+    throw new Error(
+      `Squid install fail hua (exit code: ${installResult.code}):\nSTDOUT: ${installResult.stdout || "(khaali)"}\nSTDERR: ${installResult.stderr || "(khaali)"}`
+    );
   }
 
   const userResult = await ssh.execCommand(
