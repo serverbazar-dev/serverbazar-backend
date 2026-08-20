@@ -9,6 +9,7 @@ const https = require("https");
 const Razorpay = require("razorpay");
 const fetch = require("node-fetch");
 const rateLimit = require("express-rate-limit");
+const { NodeSSH } = require("node-ssh");
 
 dotenv.config();
 
@@ -148,6 +149,11 @@ const couponLimiter = rateLimit({
   max: 20,
   message: { message: "Bahut zyada coupon attempts. Thodi der baad try karo." },
 });
+const proxyConnectLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { message: "Bahut zyada connect attempts. 15 minute baad try karo." },
+});
 
 // ==================== RAZORPAY INSTANCE ====================
 // .env me RAZORPAY_KEY_ID aur RAZORPAY_KEY_SECRET set karo (secret sirf backend me, KABHI frontend me nahi)
@@ -208,6 +214,67 @@ function escapeHtml(value) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+}
+// ==================== PROXY ENCRYPT/DECRYPT HELPERS ====================
+function encryptSecret(text) {
+  const key = Buffer.from(process.env.ENCRYPTION_KEY, "hex");
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const encrypted = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  return Buffer.concat([iv, authTag, encrypted]).toString("base64");
+}
+
+function decryptSecret(payload) {
+  const key = Buffer.from(process.env.ENCRYPTION_KEY, "hex");
+  const data = Buffer.from(payload, "base64");
+  const iv = data.subarray(0, 12);
+  const authTag = data.subarray(12, 28);
+  const encrypted = data.subarray(28);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(authTag);
+  return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
+}
+
+// ==================== USER-SERVER PROXY SETUP (Squid) ====================
+
+// Server par SSH se login karke uska OS pata karta hai (install se pehle)
+async function detectServerOS({ ip, username, password }) {
+  const ssh = new NodeSSH();
+  await ssh.connect({ host: ip, username, password, readyTimeout: 30000 });
+  const result = await ssh.execCommand(
+    "cat /etc/os-release | grep ^ID= | cut -d'=' -f2 | tr -d '\"'"
+  );
+  ssh.dispose();
+  return { os: (result.stdout || "unknown").trim() || "unknown" };
+}
+
+// Ab ye function proxy username/password KHUD generate nahi karta —
+// bahar se (user ke chune hue ya random generate hue) le leta hai
+async function setupProxyOnServer({ ip, username, password, proxyUsername, proxyPassword }) {
+  const ssh = new NodeSSH();
+  await ssh.connect({ host: ip, username, password, readyTimeout: 30000 });
+
+  const installResult = await ssh.execCommand(
+    "wget -q https://raw.githubusercontent.com/serverok/squid-proxy-installer/master/squid3-install.sh -O /root/squid3-install.sh && bash /root/squid3-install.sh"
+  );
+  if (installResult.code !== 0) {
+    ssh.dispose();
+    throw new Error(`Squid install fail hua:\n${installResult.stderr}`);
+  }
+
+  const userResult = await ssh.execCommand(
+    `htpasswd -b -c /etc/squid/passwd ${proxyUsername} ${proxyPassword}`
+  );
+  if (userResult.code !== 0) {
+    ssh.dispose();
+    throw new Error(`User add nahi ho paya:\n${userResult.stderr}`);
+  }
+
+  await ssh.execCommand("systemctl reload squid");
+  ssh.dispose();
+
+  return { proxyIp: ip, proxyPort: 3128, proxyUsername, proxyPassword };
 }
 
 // Ek chat id ko ek message bhejta hai (single request)
@@ -451,6 +518,21 @@ const walletTransactionSchema = new mongoose.Schema(
 );
 const WalletTransaction = mongoose.model("WalletTransaction", walletTransactionSchema);
 walletTransactionSchema.index({ razorpayPaymentId: 1 }, { unique: true, sparse: true });
+const proxyServerSchema = new mongoose.Schema(
+  {
+    user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    ip: { type: String, required: true, trim: true },
+    sshUsername: { type: String, required: true, trim: true },
+    sshPasswordEncrypted: { type: String, required: true },
+    proxyPort: { type: Number },
+    proxyUsername: { type: String },
+    proxyPasswordEncrypted: { type: String },
+    status: { type: String, enum: ["connecting", "active", "failed"], default: "connecting" },
+    lastError: { type: String },
+  },
+  { timestamps: true }
+);
+const ProxyServer = mongoose.model("ProxyServer", proxyServerSchema);
 
 // ==================== MIDDLEWARE (auth check) ====================
 const protect = (req, res, next) => {
@@ -1239,6 +1321,69 @@ app.post("/api/vps/request-format", protect, async (req, res) => {
     }
 
     res.json({ message: "Format request bheji gayi! Admin jald hi process karega." });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+// ==================== USER-SERVER PROXY ROUTES ====================
+
+// ---------- STEP A: CONNECT + OS DETECT KARO (install nahi) ----------
+app.post("/api/proxy/detect", protect, proxyConnectLimiter, async (req, res) => {
+  const { ip, sshUsername, sshPassword } = req.body;
+  if (!ip || !sshUsername || !sshPassword) {
+    return res.status(400).json({ message: "IP, SSH username aur password sab zaroori hai." });
+  }
+  try {
+    const result = await detectServerOS({ ip, username: sshUsername, password: sshPassword });
+    res.json({ success: true, os: result.os, port: 3128 });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Server se connect nahi ho paya.", error: err.message });
+  }
+});
+
+// ---------- STEP B: ACTUAL PROXY INSTALL KARO ----------
+// Body: { ip, sshUsername, sshPassword, proxyUsername, proxyPassword }
+app.post("/api/proxy/install", protect, proxyConnectLimiter, async (req, res) => {
+  const { ip, sshUsername, sshPassword, proxyUsername, proxyPassword } = req.body;
+  if (!ip || !sshUsername || !sshPassword || !proxyUsername || !proxyPassword) {
+    return res.status(400).json({ message: "Sab fields zaroori hain." });
+  }
+
+  const serverDoc = await ProxyServer.create({
+    user: req.userId,
+    ip,
+    sshUsername,
+    sshPasswordEncrypted: encryptSecret(sshPassword),
+    status: "connecting",
+  });
+
+  try {
+    const result = await setupProxyOnServer({
+      ip, username: sshUsername, password: sshPassword, proxyUsername, proxyPassword,
+    });
+
+    serverDoc.status = "active";
+    serverDoc.proxyPort = result.proxyPort;
+    serverDoc.proxyUsername = result.proxyUsername;
+    serverDoc.proxyPasswordEncrypted = encryptSecret(result.proxyPassword);
+    await serverDoc.save();
+
+    res.json({ message: "Proxy install ho gaya!", proxy: result });
+  } catch (err) {
+    serverDoc.status = "failed";
+    serverDoc.lastError = err.message;
+    await serverDoc.save();
+    res.status(500).json({ message: "Install nahi ho paya.", error: err.message });
+  }
+});
+
+// ---------- MERE SAARE CONNECTED PROXY SERVERS (LOGIN REQUIRED) ----------
+app.get("/api/proxy/my-servers", protect, async (req, res) => {
+  try {
+    const servers = await ProxyServer.find({ user: req.userId })
+      .select("-sshPasswordEncrypted -proxyPasswordEncrypted")
+      .sort({ createdAt: -1 });
+    res.json(servers);
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
