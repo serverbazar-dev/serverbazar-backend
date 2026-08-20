@@ -251,13 +251,26 @@ async function detectServerOS({ ip, username, password }) {
 
 // Ab ye function proxy username/password KHUD generate nahi karta —
 // bahar se (user ke chune hue ya random generate hue) le leta hai
-async function setupProxyOnServer({ ip, username, password, proxyUsername, proxyPassword }) {
+async function setupProxyOnServer({ ip, username, password, proxyUsername, proxyPassword, forceReinstall }) {
   const ssh = new NodeSSH();
   await ssh.connect({ host: ip, username, password, readyTimeout: 30000 });
+
+  if (forceReinstall) {
+    await ssh.execCommand("command -v squid-uninstall >/dev/null 2>&1 && squid-uninstall || true");
+  }
 
   const installResult = await ssh.execCommand(
     "wget -q https://raw.githubusercontent.com/serverok/squid-proxy-installer/master/squid3-install.sh -O /root/squid3-install.sh && bash /root/squid3-install.sh"
   );
+
+  const outputText = (installResult.stdout || "") + (installResult.stderr || "");
+  if (/already installed/i.test(outputText)) {
+    ssh.dispose();
+    const err = new Error("Squid pehle se installed hai is server par.");
+    err.alreadyInstalled = true;
+    throw err;
+  }
+
   if (installResult.code !== 0) {
     ssh.dispose();
     throw new Error(`Squid install fail hua:\n${installResult.stderr}`);
@@ -1344,7 +1357,7 @@ app.post("/api/proxy/detect", protect, proxyConnectLimiter, async (req, res) => 
 // ---------- STEP B: ACTUAL PROXY INSTALL KARO ----------
 // Body: { ip, sshUsername, sshPassword, proxyUsername, proxyPassword }
 app.post("/api/proxy/install", protect, proxyConnectLimiter, async (req, res) => {
-  const { ip, sshUsername, sshPassword, proxyUsername, proxyPassword } = req.body;
+  const { ip, sshUsername, sshPassword, proxyUsername, proxyPassword, forceReinstall } = req.body;
   if (!ip || !sshUsername || !sshPassword || !proxyUsername || !proxyPassword) {
     return res.status(400).json({ message: "Sab fields zaroori hain." });
   }
@@ -1360,6 +1373,7 @@ app.post("/api/proxy/install", protect, proxyConnectLimiter, async (req, res) =>
   try {
     const result = await setupProxyOnServer({
       ip, username: sshUsername, password: sshPassword, proxyUsername, proxyPassword,
+      forceReinstall: !!forceReinstall,
     });
 
     serverDoc.status = "active";
@@ -1373,6 +1387,14 @@ app.post("/api/proxy/install", protect, proxyConnectLimiter, async (req, res) =>
     serverDoc.status = "failed";
     serverDoc.lastError = err.message;
     await serverDoc.save();
+
+    if (err.alreadyInstalled) {
+      return res.status(409).json({
+        alreadyInstalled: true,
+        message: "Squid proxy is server par pehle se installed hai.",
+      });
+    }
+
     res.status(500).json({ message: "Install nahi ho paya.", error: err.message });
   }
 });
