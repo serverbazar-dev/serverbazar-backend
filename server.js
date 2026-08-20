@@ -548,6 +548,24 @@ const proxyServerSchema = new mongoose.Schema(
   { timestamps: true }
 );
 const ProxyServer = mongoose.model("ProxyServer", proxyServerSchema);
+// ==================== PROXY USAGE LOG (24-HOUR AUTO-DELETE) ====================
+function getIpSeries(ip) {
+  const parts = String(ip || "").split(".");
+  if (parts.length === 4) return `${parts[0]}.${parts[1]}.${parts[2]}.x`;
+  return ip || "-";
+}
+
+const proxyUsageLogSchema = new mongoose.Schema({
+  user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  ip: { type: String, required: true, trim: true },
+  ipSeries: { type: String },
+  sshUsername: { type: String, trim: true },
+  action: { type: String, enum: ["detect", "install"], required: true },
+  status: { type: String, enum: ["success", "failed"], required: true },
+  errorMessage: { type: String },
+  createdAt: { type: Date, default: Date.now, expires: 86400 }, // 24 hours TTL
+});
+const ProxyUsageLog = mongoose.model("ProxyUsageLog", proxyUsageLogSchema);
 
 // ==================== MIDDLEWARE (auth check) ====================
 const protect = (req, res, next) => {
@@ -1350,8 +1368,16 @@ app.post("/api/proxy/detect", protect, proxyConnectLimiter, async (req, res) => 
   }
   try {
     const result = await detectServerOS({ ip, username: sshUsername, password: sshPassword });
+    ProxyUsageLog.create({
+      user: req.userId, ip, ipSeries: getIpSeries(ip), sshUsername,
+      action: "detect", status: "success",
+    }).catch((e) => console.error("Proxy log error:", e.message));
     res.json({ success: true, os: result.os, port: 3128 });
   } catch (err) {
+    ProxyUsageLog.create({
+      user: req.userId, ip, ipSeries: getIpSeries(ip), sshUsername,
+      action: "detect", status: "failed", errorMessage: err.message,
+    }).catch((e) => console.error("Proxy log error:", e.message));
     res.status(500).json({ success: false, message: "Server se connect nahi ho paya.", error: err.message });
   }
 });
@@ -1384,11 +1410,21 @@ app.post("/api/proxy/install", protect, proxyConnectLimiter, async (req, res) =>
     serverDoc.proxyPasswordEncrypted = encryptSecret(result.proxyPassword);
     await serverDoc.save();
 
+    ProxyUsageLog.create({
+      user: req.userId, ip, ipSeries: getIpSeries(ip), sshUsername,
+      action: "install", status: "success",
+    }).catch((e) => console.error("Proxy log error:", e.message));
+
     res.json({ message: "Proxy install ho gaya!", proxy: result });
   } catch (err) {
     serverDoc.status = "failed";
     serverDoc.lastError = err.message;
     await serverDoc.save();
+
+    ProxyUsageLog.create({
+      user: req.userId, ip, ipSeries: getIpSeries(ip), sshUsername,
+      action: "install", status: "failed", errorMessage: err.message,
+    }).catch((e) => console.error("Proxy log error:", e.message));
 
     if (err.alreadyInstalled) {
       return res.status(409).json({
@@ -1408,6 +1444,25 @@ app.get("/api/proxy/my-servers", protect, async (req, res) => {
       .select("-sshPasswordEncrypted -proxyPasswordEncrypted")
       .sort({ createdAt: -1 });
     res.json(servers);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+// ---------- ADMIN: PROXY CONNECT USAGE (LAST 24 HOURS, AUTO-DELETES) ----------
+app.get("/api/admin/proxy-usage", protect, isAdmin, async (req, res) => {
+  try {
+    const logs = await ProxyUsageLog.find()
+      .populate("user", "name email phone")
+      .sort({ createdAt: -1 })
+      .limit(500);
+
+    const uniqueUsers = new Set(logs.map((l) => String(l.user?._id || l.user)));
+
+    res.json({
+      logs,
+      totalAttempts: logs.length,
+      uniqueUsersCount: uniqueUsers.size,
+    });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
