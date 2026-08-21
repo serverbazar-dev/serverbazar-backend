@@ -1884,6 +1884,11 @@ app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
   try {
     const { status, deliveryIp, deliveryUsername, deliveryPassword, deliveryOS, validityDays } = req.body;
 
+    const existingOrder = await Order.findById(req.params.id);
+    if (!existingOrder) {
+      return res.status(404).json({ message: "Order nahi mila." });
+    }
+
     const updateFields = {};
     if (req.body.vmId !== undefined) updateFields.vmId = Number(req.body.vmId) || null;
     if (status !== undefined) updateFields.status = status;
@@ -1894,7 +1899,7 @@ app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
 
     if (status === "delivered") {
       const days = Number(validityDays) > 0 ? Number(validityDays) : 30;
-      const deliveredAt = new Date();
+      const deliveredAt = existingOrder.deliveredAt || new Date();
       updateFields.deliveredAt = deliveredAt;
       updateFields.validityDays = days;
       updateFields.expiresAt = new Date(deliveredAt.getTime() + days * 24 * 60 * 60 * 1000);
@@ -1905,10 +1910,6 @@ app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
       updateFields,
       { new: true }
     );
-
-    if (!order) {
-      return res.status(404).json({ message: "Order nahi mila." });
-    }
 
     res.json({ message: "Order update ho gaya.", order });
   } catch (err) {
