@@ -1879,6 +1879,49 @@ app.get("/api/admin/orders", protect, isAdmin, async (req, res) => {
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
+// ---------- ADMIN: DATE-WISE REVENUE REPORT ----------
+app.get("/api/admin/reports/revenue", protect, isAdmin, async (req, res) => {
+  try {
+    const { from, to, category } = req.query;
+
+    const match = { paymentStatus: "paid" };
+    if (category === "vps" || category === "linux") match.category = category;
+    if (from || to) {
+      match.createdAt = {};
+      if (from) match.createdAt.$gte = new Date(`${from}T00:00:00.000Z`);
+      if (to) match.createdAt.$lte = new Date(`${to}T23:59:59.999Z`);
+    }
+
+    const rows = await Order.aggregate([
+      { $match: match },
+      {
+        $group: {
+          _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+          totalOrders: { $sum: 1 },
+          totalOriginal: { $sum: "$price" },
+          totalDiscount: { $sum: { $ifNull: ["$discountAmount", 0] } },
+          totalCollected: { $sum: { $ifNull: ["$finalAmount", "$price"] } },
+          couponOrders: { $sum: { $cond: [{ $ifNull: ["$couponCode", false] }, 1, 0] } },
+        },
+      },
+      { $sort: { _id: -1 } },
+    ]);
+
+    const summary = rows.reduce(
+      (acc, r) => {
+        acc.totalOrders += r.totalOrders;
+        acc.totalCollected += r.totalCollected;
+        acc.totalDiscount += r.totalDiscount;
+        return acc;
+      },
+      { totalOrders: 0, totalCollected: 0, totalDiscount: 0 }
+    );
+
+    res.json({ rows, summary });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
 
 app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
   try {
