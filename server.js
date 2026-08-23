@@ -442,6 +442,7 @@ const vpsPlanSchema = new mongoose.Schema(
       {
         ram: { type: String, required: true },
         price: { type: Number, required: true },
+        available: { type: Boolean, default: true },
       },
     ],
     available: { type: Boolean, default: true },
@@ -933,6 +934,9 @@ app.post("/api/coupons/validate", couponLimiter, protect, async (req, res) => {
     if (!selectedOption) {
       return res.status(400).json({ message: "Ye RAM option is plan me nahi hai." });
     }
+    if (selectedOption.available === false) {
+      return res.status(400).json({ message: "Ye RAM option abhi out of stock hai." });
+    }
 
     const currentUser = await User.findById(req.userId).select("email");
     const result = await checkCouponValidity(code, selectedOption.price, req.userId, cat, currentUser?.email);
@@ -970,6 +974,9 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
     const selectedOption = plan.ramOptions.find((o) => o.ram === ram);
     if (!selectedOption) {
       return res.status(400).json({ message: "Ye RAM option is plan me nahi hai." });
+    }
+    if (selectedOption.available === false) {
+      return res.status(400).json({ message: "Ye RAM option abhi out of stock hai." });
     }
 
     const user = await User.findById(req.userId);
@@ -2135,6 +2142,32 @@ app.delete("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
       return res.status(404).json({ message: "Plan nahi mila." });
     }
     res.json({ message: "Plan delete ho gaya." });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+// ---------- ADMIN: EK SPECIFIC RAM OPTION KA STOCK TOGGLE KARO ----------
+app.put("/api/admin/vps-plans/:id/ram-stock", protect, isAdmin, async (req, res) => {
+  try {
+    const { ram, available } = req.body;
+    if (!ram || typeof available !== "boolean") {
+      return res.status(400).json({ message: "ram aur available (true/false) dono zaroori hai." });
+    }
+
+    const plan = await VpsPlan.findById(req.params.id);
+    if (!plan) {
+      return res.status(404).json({ message: "Plan nahi mila." });
+    }
+
+    const option = plan.ramOptions.find((o) => o.ram === ram);
+    if (!option) {
+      return res.status(404).json({ message: "Ye RAM option is plan me nahi hai." });
+    }
+
+    option.available = available;
+    await plan.save();
+
+    res.json({ message: "RAM stock update ho gaya.", plan });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
