@@ -1922,6 +1922,32 @@ app.get("/api/admin/reports/revenue", protect, isAdmin, async (req, res) => {
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
+// ---------- ADMIN: EK DIN KA FULL ORDER DETAIL (date pe click karne par) ----------
+app.get("/api/admin/reports/revenue/day", protect, isAdmin, async (req, res) => {
+  try {
+    const { date, category } = req.query; // date = "2026-08-22"
+    if (!date) {
+      return res.status(400).json({ message: "Date zaroori hai." });
+    }
+
+    const start = new Date(`${date}T00:00:00.000Z`);
+    const end = new Date(`${date}T23:59:59.999Z`);
+
+    const filter = {
+      paymentStatus: "paid",
+      createdAt: { $gte: start, $lte: end },
+    };
+    if (category === "vps" || category === "linux") filter.category = category;
+
+    const orders = await Order.find(filter)
+      .populate("user", "name email phone")
+      .sort({ createdAt: -1 });
+
+    res.json({ orders });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
 
 app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
   try {
