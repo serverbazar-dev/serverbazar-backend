@@ -948,7 +948,7 @@ app.post("/api/vps/track-selection", protect, async (req, res) => {
       ram,
       stage: "selected",
       status: "success",
-      message: "User ne ye plan select karke Buy modal khola.",
+      message: "Plan dekh raha hai",
     });
     res.json({ ok: true });
   } catch (err) {
@@ -1027,7 +1027,7 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
     }
     if (selectedOption.available === false) {
       logPurchaseActivity({ user: req.userId, category: cat, vpsId, nameOrIp: plan.nameOrIp, ram: selectedOption.ram, stage: "create-payment", status: "failed", message: "RAM option out of stock tha." });
-      return res.status(400).json({ message: "Ye RAM option abhi out of stock hai." });
+      return res.status(400).json({ message: "out of stock" });
     }
 
     const user = await User.findById(req.userId);
@@ -1059,7 +1059,7 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
           await session.abortTransaction();
           session.endSession();
           logPurchaseActivity({ user: req.userId, category: cat, vpsId, nameOrIp: plan.nameOrIp, ram: selectedOption.ram, gateway: "wallet", stage: "create-payment", status: "failed", message: "Wallet me paise kam the." });
-          return res.status(400).json({ message: "Wallet me paise kam hain." });
+          return res.status(400).json({ message: "Wallet kam hain." });
         }
 
         wallet.balance -= finalAmount;
@@ -1102,7 +1102,7 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
           sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
         } catch (e) {}
 
-        logPurchaseActivity({ user: req.userId, category: cat, vpsId: plan.vpsId, nameOrIp: plan.nameOrIp, ram: selectedOption.ram, gateway: "wallet", stage: "create-payment", status: "success", message: "Wallet se order confirm hua.", amount: finalAmount });
+        logPurchaseActivity({ user: req.userId, category: cat, vpsId: plan.vpsId, nameOrIp: plan.nameOrIp, ram: selectedOption.ram, gateway: "wallet", stage: "create-payment", status: "success", message: "Order confirm ✅", amount: finalAmount });
 
         return res.status(201).json({ gateway: "wallet", message: "Wallet se payment ho gaya! Order confirm.", order });
       } catch (err) {
@@ -1266,7 +1266,7 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
     if (pending.couponCode) {
       await Coupon.updateOne({ code: pending.couponCode }, { $inc: { usedCount: 1 } });
     }
-        logPurchaseActivity({ user: pending.user, category: pending.category, vpsId: pending.vpsId, nameOrIp: pending.nameOrIp, ram: pending.ram, gateway: "razorpay", stage: "verify-payment", status: "success", message: "Payment verify ho gaya, order confirm.", amount: pending.finalAmount });
+        logPurchaseActivity({ user: pending.user, category: pending.category, vpsId: pending.vpsId, nameOrIp: pending.nameOrIp, ram: pending.ram, gateway: "razorpay", stage: "verify-payment", status: "success", message: "Payment confirm ✅", amount: pending.finalAmount });
 
   
     // ---- Telegram alert: admin ko turant naya order notify karo ----
@@ -1342,7 +1342,7 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
       await Coupon.updateOne({ code: pending.couponCode }, { $inc: { usedCount: 1 } });
     }
 
-    logPurchaseActivity({ user: pending.user, category: pending.category, vpsId: pending.vpsId, nameOrIp: pending.nameOrIp, ram: pending.ram, gateway: "cashfree", stage: "verify-payment", status: "success", message: "Payment verify ho gaya, order confirm.", amount: pending.finalAmount });
+    logPurchaseActivity({ user: pending.user, category: pending.category, vpsId: pending.vpsId, nameOrIp: pending.nameOrIp, ram: pending.ram, gateway: "cashfree", stage: "verify-payment", status: "success", message: "Payment confirm ✅", amount: pending.finalAmount });
     
     try {
       const orderedByUser = await User.findById(order.user).select("name email");
