@@ -567,6 +567,31 @@ const proxyUsageLogSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now, expires: 86400 }, // 24 hours TTL
 });
 const ProxyUsageLog = mongoose.model("ProxyUsageLog", proxyUsageLogSchema);
+// ==================== PURCHASE ACTIVITY LOG (1-HOUR AUTO-DELETE) ====================
+const purchaseActivitySchema = new mongoose.Schema({
+  user: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  category: { type: String, enum: ["vps", "linux"], default: "vps" },
+  vpsId: { type: String },
+  nameOrIp: { type: String },
+  ram: { type: String },
+  gateway: { type: String },
+  stage: {
+    type: String,
+    enum: ["selected", "coupon", "create-payment", "verify-payment"],
+    required: true,
+  },
+  status: { type: String, enum: ["success", "failed"], required: true },
+  message: { type: String },
+  amount: { type: Number },
+  createdAt: { type: Date, default: Date.now, expires: 3600 }, // 1 hour TTL
+});
+const PurchaseActivity = mongoose.model("PurchaseActivity", purchaseActivitySchema);
+
+function logPurchaseActivity(data) {
+  PurchaseActivity.create(data).catch((e) =>
+    console.error("Purchase activity log error:", e.message)
+  );
+}
 
 // ==================== MIDDLEWARE (auth check) ====================
 const protect = (req, res, next) => {
@@ -911,6 +936,25 @@ app.get("/api/vps/plans", async (req, res) => {
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
+// ---------- USER NE PLAN SELECT KARKE MODAL KHOLA (LOGIN REQUIRED) ----------
+app.post("/api/vps/track-selection", protect, async (req, res) => {
+  try {
+    const { vpsId, nameOrIp, ram, category } = req.body;
+    logPurchaseActivity({
+      user: req.userId,
+      category: category === "linux" ? "linux" : "vps",
+      vpsId,
+      nameOrIp,
+      ram,
+      stage: "selected",
+      status: "success",
+      message: "User ne ye plan select karke Buy modal khola.",
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false });
+  }
+});
 
 // ---------- COUPON VALIDATE KARO (LOGIN REQUIRED) ----------
 // Modal me "Apply" button dabane par ye call hoga — payment shuru karne se pehle
@@ -938,10 +982,14 @@ app.post("/api/coupons/validate", couponLimiter, protect, async (req, res) => {
       return res.status(400).json({ message: "Ye RAM option abhi out of stock hai." });
     }
 
-    const currentUser = await User.findById(req.userId).select("email");
+        const currentUser = await User.findById(req.userId).select("email");
     const result = await checkCouponValidity(code, selectedOption.price, req.userId, cat, currentUser?.email);
 
     if (!result.valid) {
+      logPurchaseActivity({
+        user: req.userId, category: cat, vpsId, ram,
+        stage: "coupon", status: "failed", message: result.message,
+      });
       return res.status(400).json({ message: result.message });
     }
 
@@ -967,15 +1015,18 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
 
     const plan = await VpsPlan.findOne({ vpsId, category: cat });
     if (!plan) {
+      logPurchaseActivity({ user: req.userId, category: cat, vpsId, stage: "create-payment", status: "failed", message: "Plan nahi mila." });
       return res.status(404).json({ message: "Plan nahi mila." });
     }
 
     // Price hamesha server se lo, frontend se kabhi trust mat karo
     const selectedOption = plan.ramOptions.find((o) => o.ram === ram);
     if (!selectedOption) {
+      logPurchaseActivity({ user: req.userId, category: cat, vpsId, nameOrIp: plan.nameOrIp, stage: "create-payment", status: "failed", message: "Ye RAM option is plan me nahi hai." });
       return res.status(400).json({ message: "Ye RAM option is plan me nahi hai." });
     }
     if (selectedOption.available === false) {
+      logPurchaseActivity({ user: req.userId, category: cat, vpsId, nameOrIp: plan.nameOrIp, ram: selectedOption.ram, stage: "create-payment", status: "failed", message: "RAM option out of stock tha." });
       return res.status(400).json({ message: "Ye RAM option abhi out of stock hai." });
     }
 
@@ -991,6 +1042,7 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
     if (couponCode) {
       const result = await checkCouponValidity(couponCode, selectedOption.price, req.userId, cat, user?.email);
       if (!result.valid) {
+        logPurchaseActivity({ user: req.userId, category: cat, vpsId, nameOrIp: plan.nameOrIp, ram: selectedOption.ram, stage: "create-payment", status: "failed", message: result.message });
         return res.status(400).json({ message: result.message });
       }
       discountAmount = result.discountAmount;
@@ -1006,6 +1058,7 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
         if (!wallet || wallet.balance < finalAmount) {
           await session.abortTransaction();
           session.endSession();
+          logPurchaseActivity({ user: req.userId, category: cat, vpsId, nameOrIp: plan.nameOrIp, ram: selectedOption.ram, gateway: "wallet", stage: "create-payment", status: "failed", message: "Wallet me paise kam the." });
           return res.status(400).json({ message: "Wallet me paise kam hain." });
         }
 
@@ -1048,6 +1101,8 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
           const orderedByUser = await User.findById(order.user).select("name email");
           sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
         } catch (e) {}
+
+        logPurchaseActivity({ user: req.userId, category: cat, vpsId: plan.vpsId, nameOrIp: plan.nameOrIp, ram: selectedOption.ram, gateway: "wallet", stage: "create-payment", status: "success", message: "Wallet se order confirm hua.", amount: finalAmount });
 
         return res.status(201).json({ gateway: "wallet", message: "Wallet se payment ho gaya! Order confirm.", order });
       } catch (err) {
@@ -1153,6 +1208,7 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
       .digest("hex");
 
     if (expectedSignature !== razorpay_signature) {
+      logPurchaseActivity({ user: req.userId, gateway: "razorpay", stage: "verify-payment", status: "failed", message: "Signature match nahi hui." });
       return res.status(400).json({ message: "Payment verify nahi ho paya. Signature match nahi hui." });
     }
 
@@ -1210,6 +1266,7 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
     if (pending.couponCode) {
       await Coupon.updateOne({ code: pending.couponCode }, { $inc: { usedCount: 1 } });
     }
+        logPurchaseActivity({ user: pending.user, category: pending.category, vpsId: pending.vpsId, nameOrIp: pending.nameOrIp, ram: pending.ram, gateway: "razorpay", stage: "verify-payment", status: "success", message: "Payment verify ho gaya, order confirm.", amount: pending.finalAmount });
 
   
     // ---- Telegram alert: admin ko turant naya order notify karo ----
@@ -1236,6 +1293,7 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
 
     const cfOrder = await cashfreeClient.PGFetchOrder(orderId);
     if (cfOrder.data.order_status !== "PAID") {
+      logPurchaseActivity({ user: req.userId, gateway: "cashfree", stage: "verify-payment", status: "failed", message: `Payment status: ${cfOrder.data.order_status}` });
       return res.status(400).json({ message: `Payment abhi confirm nahi hua (status: ${cfOrder.data.order_status}).` });
     }
 
@@ -1283,6 +1341,8 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
     if (pending.couponCode) {
       await Coupon.updateOne({ code: pending.couponCode }, { $inc: { usedCount: 1 } });
     }
+
+    logPurchaseActivity({ user: pending.user, category: pending.category, vpsId: pending.vpsId, nameOrIp: pending.nameOrIp, ram: pending.ram, gateway: "cashfree", stage: "verify-payment", status: "success", message: "Payment verify ho gaya, order confirm.", amount: pending.finalAmount });
     
     try {
       const orderedByUser = await User.findById(order.user).select("name email");
@@ -1469,6 +1529,23 @@ app.get("/api/admin/proxy-usage", protect, isAdmin, async (req, res) => {
       logs,
       totalAttempts: logs.length,
       uniqueUsersCount: uniqueUsers.size,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+// ---------- ADMIN: LIVE PURCHASE ACTIVITY (LAST 1 HOUR, AUTO-DELETES) ----------
+app.get("/api/admin/purchase-activity", protect, isAdmin, async (req, res) => {
+  try {
+    const logs = await PurchaseActivity.find()
+      .populate("user", "name email phone")
+      .sort({ createdAt: -1 })
+      .limit(500);
+    res.json({
+      logs,
+      total: logs.length,
+      successCount: logs.filter((l) => l.status === "success").length,
+      failedCount: logs.filter((l) => l.status === "failed").length,
     });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
