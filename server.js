@@ -136,6 +136,8 @@ app.use(cors({
 }));
 
 app.use(express.json());
+const proxyJobLogs = new Map();
+const proxyJobStatus = new Map();
 // Login/Register ke liye limiter — 15 min me max 10 tries per IP
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -251,16 +253,39 @@ async function detectServerOS({ ip, username, password }) {
 
 // Ab ye function proxy username/password KHUD generate nahi karta —
 // bahar se (user ke chune hue ya random generate hue) le leta hai
-async function setupProxyOnServer({ ip, username, password, proxyUsername, proxyPassword, forceReinstall }) {
+async function setupProxyOnServer({ ip, username, password, proxyUsername, proxyPassword, forceReinstall, onLog }) {
   const ssh = new NodeSSH();
+  onLog?.(`Connecting to ${ip}...`);
   await ssh.connect({ host: ip, username, password, readyTimeout: 30000 });
+  onLog?.(`ssh ${username}@${ip}`);
+  onLog?.(`Connected successfully!`);
+
+  const osCheck = await ssh.execCommand(
+    "cat /etc/os-release | grep ^ID= | cut -d'=' -f2 | tr -d '\"'"
+  );
+  const os = (osCheck.stdout || "unknown").trim() || "unknown";
+  onLog?.(`Detected OS: ${os}`);
 
   if (forceReinstall) {
+    onLog?.(`Removing old squid installation...`);
     await ssh.execCommand("command -v squid-uninstall >/dev/null 2>&1 && squid-uninstall || true");
   }
 
+  onLog?.(`Starting proxy setup...`);
+  onLog?.(`Installing Squid proxy server...`);
+
   const installResult = await ssh.execCommand(
-    "wget -q https://raw.githubusercontent.com/serverok/squid-proxy-installer/master/squid3-install.sh -O /root/squid3-install.sh && bash /root/squid3-install.sh"
+    "wget -q https://raw.githubusercontent.com/serverok/squid-proxy-installer/master/squid3-install.sh -O /root/squid3-install.sh && bash /root/squid3-install.sh",
+    {
+      onStdout: (chunk) => {
+        const line = chunk.toString().trim();
+        if (line) onLog?.(line);
+      },
+      onStderr: (chunk) => {
+        const line = chunk.toString().trim();
+        if (line) onLog?.(line);
+      },
+    }
   );
 
   const outputText = (installResult.stdout || "") + (installResult.stderr || "");
@@ -278,6 +303,9 @@ async function setupProxyOnServer({ ip, username, password, proxyUsername, proxy
     );
   }
 
+  onLog?.(`Squid proxy installed`);
+  onLog?.(`Creating user "${proxyUsername}"...`);
+
   const userResult = await ssh.execCommand(
     `htpasswd -b -c /etc/squid/passwd ${proxyUsername} ${proxyPassword}`
   );
@@ -285,8 +313,13 @@ async function setupProxyOnServer({ ip, username, password, proxyUsername, proxy
     ssh.dispose();
     throw new Error(`User add nahi ho paya:\n${userResult.stderr}`);
   }
+  onLog?.(`User "${proxyUsername}" created`);
 
+  onLog?.(`Reloading squid config...`);
   await ssh.execCommand("systemctl reload squid");
+  onLog?.(`Firewall port 3128 opened`);
+  onLog?.(`Proxy server is running!`);
+
   ssh.dispose();
 
   return { proxyIp: ip, proxyPort: 3128, proxyUsername, proxyPassword };
@@ -1449,7 +1482,7 @@ app.post("/api/proxy/detect", protect, proxyConnectLimiter, async (req, res) => 
   }
 });
 
-// ---------- STEP B: ACTUAL PROXY INSTALL KARO ----------
+// ---------- STEP B: ACTUAL PROXY INSTALL KARO (background job, live logs ke saath) ----------
 // Body: { ip, sshUsername, sshPassword, proxyUsername, proxyPassword }
 app.post("/api/proxy/install", protect, proxyConnectLimiter, async (req, res) => {
   const { ip, sshUsername, sshPassword, proxyUsername, proxyPassword, forceReinstall } = req.body;
@@ -1457,18 +1490,26 @@ app.post("/api/proxy/install", protect, proxyConnectLimiter, async (req, res) =>
     return res.status(400).json({ message: "Sab fields zaroori hain." });
   }
 
-  const serverDoc = await ProxyServer.create({
-    user: req.userId,
-    ip,
-    sshUsername,
-    sshPasswordEncrypted: encryptSecret(sshPassword),
-    status: "connecting",
-  });
+  const jobId = crypto.randomUUID();
+  proxyJobLogs.set(jobId, []);
+  proxyJobStatus.set(jobId, "running");
+  res.json({ jobId }); // turant respond, kaam background me chalega
+
+  const onLog = (line) => proxyJobLogs.get(jobId).push(line);
+  let serverDoc = null;
 
   try {
+    serverDoc = await ProxyServer.create({
+      user: req.userId,
+      ip,
+      sshUsername,
+      sshPasswordEncrypted: encryptSecret(sshPassword),
+      status: "connecting",
+    });
+
     const result = await setupProxyOnServer({
       ip, username: sshUsername, password: sshPassword, proxyUsername, proxyPassword,
-      forceReinstall: !!forceReinstall,
+      forceReinstall: !!forceReinstall, onLog,
     });
 
     serverDoc.status = "active";
@@ -1482,26 +1523,69 @@ app.post("/api/proxy/install", protect, proxyConnectLimiter, async (req, res) =>
       action: "install", status: "success",
     }).catch((e) => console.error("Proxy log error:", e.message));
 
-    res.json({ message: "Proxy install ho gaya!", proxy: result });
+    proxyJobStatus.set(jobId, "done");
+    proxyJobLogs.get(jobId).push("__RESULT__" + JSON.stringify(result));
   } catch (err) {
-    serverDoc.status = "failed";
-    serverDoc.lastError = err.message;
-    await serverDoc.save();
+    if (serverDoc) {
+      serverDoc.status = "failed";
+      serverDoc.lastError = err.message;
+      await serverDoc.save().catch(() => {});
+    }
 
     ProxyUsageLog.create({
       user: req.userId, ip, ipSeries: getIpSeries(ip), sshUsername,
       action: "install", status: "failed", errorMessage: err.message,
     }).catch((e) => console.error("Proxy log error:", e.message));
 
+    proxyJobStatus.set(jobId, "failed");
     if (err.alreadyInstalled) {
-      return res.status(409).json({
-        alreadyInstalled: true,
-        message: "Squid proxy is server par pehle se installed hai.",
-      });
+      proxyJobLogs.get(jobId).push("__ALREADY_INSTALLED__");
+    } else {
+      proxyJobLogs.get(jobId).push("__ERROR__" + err.message);
     }
-
-    res.status(500).json({ message: "Install nahi ho paya.", error: err.message });
   }
+
+  // 10 min baad job cleanup — memory leak na ho
+  setTimeout(() => {
+    proxyJobLogs.delete(jobId);
+    proxyJobStatus.delete(jobId);
+  }, 10 * 60 * 1000);
+});
+// ---------- STEP B (LIVE): INSTALL PROGRESS STREAM (SSE) ----------
+app.get("/api/proxy/install-stream/:jobId", (req, res) => {
+  const { jobId } = req.params;
+  const { token: qToken } = req.query;
+
+  // EventSource headers nahi bhej sakta, isliye query param se token verify karo
+  try {
+    jwt.verify(qToken, process.env.JWT_SECRET);
+  } catch (e) {
+    return res.status(401).end();
+  }
+
+  if (!proxyJobLogs.has(jobId)) {
+    return res.status(404).end();
+  }
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  let sentCount = 0;
+  const interval = setInterval(() => {
+    const logs = proxyJobLogs.get(jobId) || [];
+    while (sentCount < logs.length) {
+      res.write(`data: ${JSON.stringify(logs[sentCount])}\n\n`);
+      sentCount++;
+    }
+    if (proxyJobStatus.get(jobId) !== "running") {
+      clearInterval(interval);
+      res.end();
+    }
+  }, 300);
+
+  req.on("close", () => clearInterval(interval));
 });
 
 // ---------- MERE SAARE CONNECTED PROXY SERVERS (LOGIN REQUIRED) ----------
