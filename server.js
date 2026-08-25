@@ -10,6 +10,7 @@ const Razorpay = require("razorpay");
 const fetch = require("node-fetch");
 const rateLimit = require("express-rate-limit");
 const { NodeSSH } = require("node-ssh");
+const nodemailer = require("nodemailer");
 
 dotenv.config();
 
@@ -215,6 +216,56 @@ function escapeHtml(value) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 }
+
+// ==================== EMAIL (ORDER CONFIRMATION) ====================
+const emailTransporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
+
+function buildOrderEmailHTML({ user, order }) {
+  const categoryLabel = order.category === "linux" ? "Linux IP" : "VPS";
+  return `
+  <div style="font-family:Arial,sans-serif; max-width:600px; margin:auto; border:1px solid #eee; border-radius:10px; overflow:hidden;">
+    <div style="background:#ff7a1e; padding:20px; color:#fff; text-align:center;">
+      <h2 style="margin:0;">✅ Order Confirmed - ServerBazar</h2>
+    </div>
+    <div style="padding:24px; color:#222;">
+      <p>Hi <b>${escapeHtml(user?.name)}</b>,</p>
+      <p>Aapka order successfully confirm ho gaya hai. Details neeche hain:</p>
+      <table style="width:100%; border-collapse:collapse; margin-top:16px;">
+        <tr><td style="padding:8px 0; color:#666;">Order Type</td><td style="padding:8px 0; text-align:right;"><b>${categoryLabel}</b></td></tr>
+        <tr><td style="padding:8px 0; color:#666;">Plan / IP</td><td style="padding:8px 0; text-align:right;"><b>${escapeHtml(order.nameOrIp || order.planName)}</b></td></tr>
+        <tr><td style="padding:8px 0; color:#666;">RAM</td><td style="padding:8px 0; text-align:right;">${escapeHtml(order.ram || "-")}</td></tr>
+        <tr><td style="padding:8px 0; color:#666;">Price</td><td style="padding:8px 0; text-align:right;">₹${order.price}</td></tr>
+        ${order.couponCode ? `<tr><td style="padding:8px 0; color:#666;">Coupon</td><td style="padding:8px 0; text-align:right;">${escapeHtml(order.couponCode)} (−₹${order.discountAmount})</td></tr>` : ""}
+        <tr><td style="padding:8px 0; color:#666; font-weight:bold;">Total Paid</td><td style="padding:8px 0; text-align:right; font-weight:bold; color:#ff7a1e;">₹${order.finalAmount}</td></tr>
+        <tr><td style="padding:8px 0; color:#666;">Order ID</td><td style="padding:8px 0; text-align:right; font-family:monospace;">${order._id}</td></tr>
+      </table>
+      <p style="margin-top:20px;">Hamari team jald hi aapko delivery details bhejegi. Kisi bhi query ke liye WhatsApp par contact karo.</p>
+      <p style="margin-top:24px; color:#888; font-size:13px;">— ServerBazar Team</p>
+    </div>
+  </div>`;
+}
+
+function sendOrderConfirmationEmail({ user, order }) {
+  if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+    console.warn("Email skipped: EMAIL_USER / EMAIL_PASS .env me set nahi hai.");
+    return;
+  }
+  if (!user?.email) return;
+
+  emailTransporter.sendMail({
+    from: `"ServerBazar" <${process.env.EMAIL_USER}>`,
+    to: user.email,
+    subject: `✅ Order Confirmed - ${order.nameOrIp || order.planName}`,
+    html: buildOrderEmailHTML({ user, order }),
+  }).catch((err) => console.error("Order email bhejte waqt error:", err.message));
+}
+
 // ==================== PROXY ENCRYPT/DECRYPT HELPERS ====================
 function encryptSecret(text) {
   const key = Buffer.from(process.env.ENCRYPTION_KEY, "hex");
@@ -1098,9 +1149,10 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
         session.endSession();
 
         try {
-          const orderedByUser = await User.findById(order.user).select("name email");
-          sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
-        } catch (e) {}
+  const orderedByUser = await User.findById(order.user).select("name email");
+  sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
+  sendOrderConfirmationEmail({ user: orderedByUser, order });
+} catch (e) {}
 
         logPurchaseActivity({ user: req.userId, category: cat, vpsId: plan.vpsId, nameOrIp: plan.nameOrIp, ram: selectedOption.ram, gateway: "wallet", stage: "create-payment", status: "success", message: "Order confirm ✅", amount: finalAmount });
 
@@ -1272,11 +1324,12 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
     // ---- Telegram alert: admin ko turant naya order notify karo ----
     // Ye fire-and-forget hai — Telegram fail bhi ho jaye to order response par asar nahi padega.
     try {
-      const orderedByUser = await User.findById(order.user).select("name email");
-      sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
-    } catch (alertErr) {
-      console.error("Telegram alert bhejte waqt error:", alertErr.message);
-    }
+  const orderedByUser = await User.findById(order.user).select("name email");
+  sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
+  sendOrderConfirmationEmail({ user: orderedByUser, order });
+} catch (alertErr) {
+  console.error("Telegram alert bhejte waqt error:", alertErr.message);
+}
 
     res.status(201).json({ message: "Payment successful! Order confirm ho gaya.", order });
   } catch (err) {
@@ -1345,11 +1398,12 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
     logPurchaseActivity({ user: pending.user, category: pending.category, vpsId: pending.vpsId, nameOrIp: pending.nameOrIp, ram: pending.ram, gateway: "cashfree", stage: "verify-payment", status: "success", message: "Payment confirm ✅", amount: pending.finalAmount });
     
     try {
-      const orderedByUser = await User.findById(order.user).select("name email");
-      sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
-    } catch (alertErr) {
-      console.error("Telegram alert bhejte waqt error:", alertErr.message);
-    }
+  const orderedByUser = await User.findById(order.user).select("name email");
+  sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
+  sendOrderConfirmationEmail({ user: orderedByUser, order });
+} catch (alertErr) {
+  console.error("Telegram alert bhejte waqt error:", alertErr.message);
+}
 
     res.status(201).json({ message: "Payment successful! Order confirm ho gaya.", order });
   } catch (err) {
