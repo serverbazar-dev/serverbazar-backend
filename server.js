@@ -252,18 +252,27 @@ function buildOrderEmailHTML({ user, order }) {
 }
 
 function sendOrderConfirmationEmail({ user, order }) {
+  console.log("📧 Email function chal raha hai. User email:", user?.email);
+  console.log("📧 EMAIL_USER set hai?", !!process.env.EMAIL_USER);
+  console.log("📧 EMAIL_PASS set hai?", !!process.env.EMAIL_PASS);
+
   if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-    console.warn("Email skipped: EMAIL_USER / EMAIL_PASS .env me set nahi hai.");
+    console.warn("❌ Email skip: EMAIL_USER/EMAIL_PASS .env me nahi hai.");
     return;
   }
-  if (!user?.email) return;
+  if (!user?.email) {
+    console.warn("❌ Email skip: user ka email khaali hai.");
+    return;
+  }
 
   emailTransporter.sendMail({
     from: `"ServerBazar" <${process.env.EMAIL_USER}>`,
     to: user.email,
     subject: `✅ Order Confirmed - ${order.nameOrIp || order.planName}`,
     html: buildOrderEmailHTML({ user, order }),
-  }).catch((err) => console.error("Order email bhejte waqt error:", err.message));
+  })
+  .then((info) => console.log("✅ Email chali gayi:", info.response))
+  .catch((err) => console.error("❌ Email fail ho gaya:", err.message));
 }
 
 // ==================== PROXY ENCRYPT/DECRYPT HELPERS ====================
