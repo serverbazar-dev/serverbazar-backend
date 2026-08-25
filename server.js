@@ -1,6 +1,3 @@
-const dns = require("dns");
-dns.setDefaultResultOrder("ipv4first");
-
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
@@ -14,7 +11,6 @@ const fetch = require("node-fetch");
 const rateLimit = require("express-rate-limit");
 const { NodeSSH } = require("node-ssh");
 const nodemailer = require("nodemailer");
-const PDFDocument = require("pdfkit");
 
 dotenv.config();
 
@@ -221,156 +217,53 @@ function escapeHtml(value) {
     .replace(/>/g, "&gt;");
 }
 
-// ==================== EMAIL + PDF INVOICE (ORDER CONFIRMATION) ====================
+// ==================== EMAIL (ORDER CONFIRMATION) ====================
 const emailTransporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 465,
-  secure: true,
+  service: "gmail",
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS,
   },
-  family: 4,
 });
 
-function generateInvoicePDFBuffer({ user, order }) {
-  return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ size: "A4", margin: 40 });
-    const buffers = [];
-    doc.on("data", (chunk) => buffers.push(chunk));
-    doc.on("end", () => resolve(Buffer.concat(buffers)));
-    doc.on("error", reject);
-
-    const orange = "#ff7a1e";
-    const dark = "#0b0b0e";
-    const pageWidth = doc.page.width;
-
-    // ---- Header ----
-    doc.rect(0, 0, pageWidth, 90).fill(dark);
-    doc.fillColor(orange).fontSize(22).font("Helvetica-Bold").text("SERVER BAZAR", 40, 25);
-    doc.fillColor("#ffffff").fontSize(10).font("Helvetica").text("VPS & IP SALE", 40, 52);
-    doc.fillColor(orange).fontSize(20).font("Helvetica-Bold").text("INVOICE / BILL", 0, 32, { align: "right", width: pageWidth - 40 });
-
-    const invoiceNo = `INV-${order._id.toString().slice(-8).toUpperCase()}`;
-    const invoiceDate = new Date(order.createdAt).toLocaleDateString("en-IN");
-
-    doc.fillColor("#000000");
-
-    // ---- Invoice Details (right) ----
-    let y = 110;
-    doc.font("Helvetica-Bold").fontSize(10).text("Invoice No:", 350, y);
-    doc.font("Helvetica").text(invoiceNo, 450, y);
-    y += 18;
-    doc.font("Helvetica-Bold").text("Invoice Date:", 350, y);
-    doc.font("Helvetica").text(invoiceDate, 450, y);
-    y += 18;
-    doc.font("Helvetica-Bold").text("Payment Status:", 350, y);
-    doc.fillColor("green").font("Helvetica-Bold").text("PAID", 450, y);
-    doc.fillColor("#000000");
-
-    // ---- Bill To (left) ----
-    y = 110;
-    doc.font("Helvetica-Bold").fontSize(12).text("BILL TO", 40, y);
-    y += 20;
-    doc.font("Helvetica").fontSize(10);
-    doc.text(`Customer Name: ${user?.name || "-"}`, 40, y); y += 16;
-    doc.text(`Email: ${user?.email || "-"}`, 40, y); y += 16;
-    doc.text(`Phone: ${user?.phone || "-"}`, 40, y);
-
-    // ---- Table Header ----
-    y = 220;
-    doc.rect(40, y, 520, 22).fill(orange);
-    doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(10);
-    doc.text("S.NO", 45, y + 6);
-    doc.text("PRODUCT / SERVICE", 90, y + 6);
-    doc.text("DESCRIPTION", 260, y + 6);
-    doc.text("QTY", 410, y + 6);
-    doc.text("AMOUNT (₹)", 460, y + 6);
-
-    // ---- Table Rows ----
-    y += 22;
-    doc.fillColor("#000000").font("Helvetica").fontSize(10);
-    const categoryLabel = order.category === "linux" ? "Linux IP" : "VPS Server";
-
-    const rows = [
-      { sno: 1, name: categoryLabel, desc: `${order.nameOrIp || order.planName} (${order.ram || "-"})`, qty: 1, amount: order.price },
-    ];
-    if (order.discountAmount > 0) {
-      rows.push({ sno: 2, name: "Coupon Discount", desc: order.couponCode || "-", qty: 1, amount: -order.discountAmount });
-    }
-
-    rows.forEach((r) => {
-      doc.rect(40, y, 520, 24).stroke("#dddddd");
-      doc.text(String(r.sno), 45, y + 7);
-      doc.text(r.name, 90, y + 7, { width: 160 });
-      doc.text(r.desc, 260, y + 7, { width: 140 });
-      doc.text(String(r.qty), 410, y + 7);
-      doc.text(`₹${r.amount}`, 460, y + 7);
-      y += 24;
-    });
-
-    // ---- Totals ----
-    y += 14;
-    doc.font("Helvetica-Bold").fontSize(10);
-    doc.text("Subtotal:", 400, y);
-    doc.font("Helvetica").text(`₹${order.price}`, 500, y);
-    y += 16;
-    doc.font("Helvetica-Bold").text("Discount:", 400, y);
-    doc.font("Helvetica").text(`-₹${order.discountAmount || 0}`, 500, y);
-    y += 20;
-
-    doc.rect(390, y, 170, 24).fill(orange);
-    doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(11);
-    doc.text("GRAND TOTAL:", 400, y + 7);
-    doc.text(`₹${order.finalAmount}`, 500, y + 7);
-    doc.fillColor("#000000");
-
-    // ---- Footer ----
-    y += 60;
-    doc.font("Helvetica").fontSize(9).fillColor("#555555");
-    doc.text("Thank you for choosing ServerBazar!", 40, y);
-    doc.text("Payment once made is subject to applicable refund policy.", 40, y + 14);
-    doc.text("Services will be activated after successful verification.", 40, y + 28);
-    doc.text("For support: 9239535160 | serverbazarsupport@gmail.com | www.serverbazar.com", 40, y + 46);
-
-    doc.end();
-  });
+function buildOrderEmailHTML({ user, order }) {
+  const categoryLabel = order.category === "linux" ? "Linux IP" : "VPS";
+  return `
+  <div style="font-family:Arial,sans-serif; max-width:600px; margin:auto; border:1px solid #eee; border-radius:10px; overflow:hidden;">
+    <div style="background:#ff7a1e; padding:20px; color:#fff; text-align:center;">
+      <h2 style="margin:0;">✅ Order Confirmed - ServerBazar</h2>
+    </div>
+    <div style="padding:24px; color:#222;">
+      <p>Hi <b>${escapeHtml(user?.name)}</b>,</p>
+      <p>Aapka order successfully confirm ho gaya hai. Details neeche hain:</p>
+      <table style="width:100%; border-collapse:collapse; margin-top:16px;">
+        <tr><td style="padding:8px 0; color:#666;">Order Type</td><td style="padding:8px 0; text-align:right;"><b>${categoryLabel}</b></td></tr>
+        <tr><td style="padding:8px 0; color:#666;">Plan / IP</td><td style="padding:8px 0; text-align:right;"><b>${escapeHtml(order.nameOrIp || order.planName)}</b></td></tr>
+        <tr><td style="padding:8px 0; color:#666;">RAM</td><td style="padding:8px 0; text-align:right;">${escapeHtml(order.ram || "-")}</td></tr>
+        <tr><td style="padding:8px 0; color:#666;">Price</td><td style="padding:8px 0; text-align:right;">₹${order.price}</td></tr>
+        ${order.couponCode ? `<tr><td style="padding:8px 0; color:#666;">Coupon</td><td style="padding:8px 0; text-align:right;">${escapeHtml(order.couponCode)} (−₹${order.discountAmount})</td></tr>` : ""}
+        <tr><td style="padding:8px 0; color:#666; font-weight:bold;">Total Paid</td><td style="padding:8px 0; text-align:right; font-weight:bold; color:#ff7a1e;">₹${order.finalAmount}</td></tr>
+        <tr><td style="padding:8px 0; color:#666;">Order ID</td><td style="padding:8px 0; text-align:right; font-family:monospace;">${order._id}</td></tr>
+      </table>
+      <p style="margin-top:20px;">Hamari team jald hi aapko delivery details bhejegi. Kisi bhi query ke liye WhatsApp par contact karo.</p>
+      <p style="margin-top:24px; color:#888; font-size:13px;">— ServerBazar Team</p>
+    </div>
+  </div>`;
 }
 
-async function sendOrderConfirmationEmail({ user, order }) {
+function sendOrderConfirmationEmail({ user, order }) {
   if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
     console.warn("Email skipped: EMAIL_USER / EMAIL_PASS .env me set nahi hai.");
     return;
   }
   if (!user?.email) return;
 
-  try {
-    const pdfBuffer = await generateInvoicePDFBuffer({ user, order });
-
-    await emailTransporter.sendMail({
-      from: `"ServerBazar" <${process.env.EMAIL_USER}>`,
-      to: user.email,
-      subject: `🧾 Your Purchase Bill - ${order.nameOrIp || order.planName}`,
-      html: `
-        <div style="font-family:Arial,sans-serif; max-width:600px; margin:auto;">
-          <p>Hi <b>${escapeHtml(user?.name)}</b>,</p>
-          <p>Thank you for your purchase! Aapka <b>purchase bill</b> is email ke saath PDF format me attach kiya gaya hai.</p>
-          <p>Order ID: <b>${order._id}</b></p>
-          <p>Hamari team jald hi aapko delivery details bhejegi. Kisi bhi query ke liye WhatsApp par contact karo.</p>
-          <p style="color:#888; font-size:13px; margin-top:24px;">— ServerBazar Team</p>
-        </div>
-      `,
-      attachments: [
-        {
-          filename: `Invoice-${order._id}.pdf`,
-          content: pdfBuffer,
-          contentType: "application/pdf",
-        },
-      ],
-    });
-  } catch (err) {
-    console.error("Order email/PDF bhejte waqt error:", err.message);
-  }
+  emailTransporter.sendMail({
+    from: `"ServerBazar" <${process.env.EMAIL_USER}>`,
+    to: user.email,
+    subject: `✅ Order Confirmed - ${order.nameOrIp || order.planName}`,
+    html: buildOrderEmailHTML({ user, order }),
+  }).catch((err) => console.error("Order email bhejte waqt error:", err.message));
 }
 
 // ==================== PROXY ENCRYPT/DECRYPT HELPERS ====================
