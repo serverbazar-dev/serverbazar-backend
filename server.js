@@ -394,7 +394,7 @@ const orderSchema = new mongoose.Schema(
   {
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     planName: { type: String, required: true },
-    category: { type: String, enum: ["vps", "linux"], default: "vps" }, // vps ya linux
+    category: { type: String, enum: ["vps", "linux", "slot"], default: "vps" }, // vps, linux ya slot
     vpsId: { type: String },
     nameOrIp: { type: String }, // plan ka listed IP/name jo user ne khareeda
     ram: { type: String },
@@ -448,7 +448,7 @@ const vpsPlanSchema = new mongoose.Schema(
     ],
     available: { type: Boolean, default: true },
     bestSeller: { type: Boolean, default: false }, // admin manually marks this as "Most Demanded"
-    category: { type: String, enum: ["vps", "linux"], default: "vps" }, // "vps" ya "linux"
+    category: { type: String, enum: ["vps", "linux", "slot"], default: "vps" }, // "vps", "linux" ya "slot"
   },
   { timestamps: true }
 );
@@ -485,7 +485,7 @@ paymentGateway: { type: String, enum: ["razorpay", "cashfree", "wallet"], defaul
     vpsId: { type: String, required: true },
     nameOrIp: { type: String },
     planName: { type: String, required: true },
-    category: { type: String, enum: ["vps", "linux"], default: "vps" },
+    category: { type: String, enum: ["vps", "linux", "slot"], default: "vps" },
     ram: { type: String, required: true },
     price: { type: Number, required: true }, // original price
     couponCode: { type: String },
@@ -571,7 +571,7 @@ const ProxyUsageLog = mongoose.model("ProxyUsageLog", proxyUsageLogSchema);
 // ==================== PURCHASE ACTIVITY LOG (1-HOUR AUTO-DELETE) ====================
 const purchaseActivitySchema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
-  category: { type: String, enum: ["vps", "linux"], default: "vps" },
+  category: { type: String, enum: ["vps", "linux", "slot"], default: "vps" },
   vpsId: { type: String },
   nameOrIp: { type: String },
   ram: { type: String },
@@ -929,7 +929,7 @@ app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
 
 app.get("/api/vps/plans", async (req, res) => {
   try {
-    const category = req.query.category === "linux" ? "linux" : "vps";
+    const category = ["vps", "linux", "slot"].includes(req.query.category) ? req.query.category : "vps";
     // available: true hatao — saare plans aayenge
     const plans = await VpsPlan.find({ category }).sort({ createdAt: -1 });
     res.json(plans);
@@ -943,7 +943,7 @@ app.post("/api/vps/track-selection", protect, async (req, res) => {
     const { vpsId, nameOrIp, ram, category } = req.body;
     logPurchaseActivity({
       user: req.userId,
-      category: category === "linux" ? "linux" : "vps",
+      category: ["vps", "linux", "slot"].includes(category) ? category : "vps",
       vpsId,
       nameOrIp,
       ram,
@@ -964,7 +964,7 @@ app.post("/api/vps/track-selection", protect, async (req, res) => {
 app.post("/api/coupons/validate", couponLimiter, protect, async (req, res) => {
   try {
     const { code, vpsId, ram, category } = req.body;
-    const cat = category === "linux" ? "linux" : "vps";
+    const cat = ["vps", "linux", "slot"].includes(category) ? category : "vps";
 
     if (!code) {
       return res.status(400).json({ message: "Coupon code do." });
@@ -1012,7 +1012,7 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
   try {
     const { vpsId, ram, couponCode, category, gateway } = req.body;
     const selectedGateway = ["cashfree", "razorpay", "wallet"].includes(gateway) ? gateway : ACTIVE_GATEWAY;
-    const cat = category === "linux" ? "linux" : "vps";
+    const cat = ["vps", "linux", "slot"].includes(category) ? category : "vps";
 
     const plan = await VpsPlan.findOne({ vpsId, category: cat });
     if (!plan) {
@@ -2148,7 +2148,7 @@ app.put("/api/vps/orders/:id/ack-format", protect, async (req, res) => {
 app.get("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
   try {
     const filter = {};
-    if (req.query.category === "vps" || req.query.category === "linux") {
+    if (["vps", "linux", "slot"].includes(req.query.category)) {
       filter.category = req.query.category;
     }
     const plans = await VpsPlan.find(filter).sort({ createdAt: -1 });
@@ -2178,7 +2178,7 @@ app.post("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
       company,
       ramOptions,
       bestSeller: !!bestSeller,
-      category: category === "linux" ? "linux" : "vps",
+      category: ["vps", "linux", "slot"].includes(category) ? category : "vps",
     });
     res.status(201).json({ message: "Plan add ho gaya!", plan });
   } catch (err) {
@@ -2197,7 +2197,7 @@ app.put("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
     if (ramOptions !== undefined) updateFields.ramOptions = ramOptions;
     if (available !== undefined) updateFields.available = available;
     if (bestSeller !== undefined) updateFields.bestSeller = bestSeller;
-    if (category !== undefined) updateFields.category = category === "linux" ? "linux" : "vps";
+    if (category !== undefined) updateFields.category = ["vps", "linux", "slot"].includes(category) ? category : "vps";
 
     const plan = await VpsPlan.findByIdAndUpdate(
       req.params.id,
