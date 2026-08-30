@@ -413,6 +413,7 @@ paymentGateway: { type: String, enum: ["razorpay", "cashfree", "wallet"], defaul
     paymentStatus: { type: String, default: "paid" }, // order sirf tabhi banta hai jab payment verify ho jaye
     // ---- delivery details (admin fill karega jab VPS actually deliver kare) ----
     deliveryIp: { type: String },
+        deliveryPort: { type: String },
     deliveryUsername: { type: String },
     deliveryPassword: { type: String },
     deliveryOS: { type: String },
@@ -2035,7 +2036,7 @@ app.get("/api/admin/reports/revenue/day", protect, isAdmin, async (req, res) => 
 
 app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
   try {
-    const { status, deliveryIp, deliveryUsername, deliveryPassword, deliveryOS, validityDays } = req.body;
+    const { status, deliveryIp, deliveryPort, deliveryUsername, deliveryPassword, deliveryOS, validityDays } = req.body;
 
     const existingOrder = await Order.findById(req.params.id);
     if (!existingOrder) {
@@ -2046,6 +2047,7 @@ app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
     if (req.body.vmId !== undefined) updateFields.vmId = Number(req.body.vmId) || null;
     if (status !== undefined) updateFields.status = status;
     if (deliveryIp !== undefined) updateFields.deliveryIp = deliveryIp;
+        if (deliveryPort !== undefined) updateFields.deliveryPort = deliveryPort;
     if (deliveryUsername !== undefined) updateFields.deliveryUsername = deliveryUsername;
     if (deliveryPassword !== undefined) updateFields.deliveryPassword = deliveryPassword;
     if (deliveryOS !== undefined) updateFields.deliveryOS = deliveryOS;
@@ -2097,7 +2099,7 @@ app.get("/api/admin/format-requests", protect, isAdmin, async (req, res) => {
 // ---------- ADMIN: FORMAT REQUEST APPROVE KARO ----------
 app.put("/api/admin/format-requests/:id/approve", protect, isAdmin, async (req, res) => {
   try {
-    const { solution, deliveryIp, deliveryUsername, deliveryPassword, deliveryOS } = req.body;
+    const { solution, deliveryIp, deliveryPort, deliveryUsername, deliveryPassword, deliveryOS } = req.body;
     if (!solution || !solution.trim()) {
       return res.status(400).json({ message: "Solution likhna zaroori hai." });
     }
@@ -2109,6 +2111,7 @@ app.put("/api/admin/format-requests/:id/approve", protect, isAdmin, async (req, 
       formatSeenByUser: false,
     };
     if (deliveryIp !== undefined && deliveryIp.trim()) updateFields.deliveryIp = deliveryIp.trim();
+        if (deliveryPort !== undefined && deliveryPort.trim()) updateFields.deliveryPort = deliveryPort.trim();
     if (deliveryUsername !== undefined && deliveryUsername.trim()) updateFields.deliveryUsername = deliveryUsername.trim();
     if (deliveryPassword !== undefined && deliveryPassword.trim()) updateFields.deliveryPassword = deliveryPassword.trim();
     if (deliveryOS !== undefined && deliveryOS.trim()) updateFields.deliveryOS = deliveryOS.trim();
