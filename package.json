@@ -19,7 +19,7 @@
     "multer": "^2.2.0",
     "node-fetch": "^2.7.0",
     "node-ssh": "^13.2.1",
-    "nodemailer": "^9.0.5",
+    "nodemailer": "^9.1.0",
     "razorpay": "^2.9.8"
   },
   "devDependencies": {

@@ -12,6 +12,31 @@ const rateLimit = require("express-rate-limit");
 const { NodeSSH } = require("node-ssh");
 
 dotenv.config();
+const nodemailer = require("nodemailer");
+
+const mailTransporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT) || 587,
+  secure: false,
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  },
+});
+
+mailTransporter.verify((err) => {
+  if (err) console.error("SMTP connection fail ❌", err.message);
+  else console.log("SMTP ready ✅ — emails bhejne ke liye taiyaar");
+});
+
+async function sendOtpEmail(toEmail, otp) {
+  await mailTransporter.sendMail({
+    from: process.env.SMTP_FROM,
+    to: toEmail,
+    subject: "ServerBazar - Password Reset OTP",
+    html: `<p>Aapka OTP hai: <b style="font-size:20px">${otp}</b></p><p>Ye 10 minute me expire ho jayega. Agar aapne request nahi ki, ignore karo.</p>`,
+  });
+}
 
 const { Cashfree, CFEnvironment } = require("cashfree-pg");
 let cashfreeClient = new Cashfree(
