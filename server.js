@@ -16,8 +16,8 @@ const nodemailer = require("nodemailer");
 
 const mailTransporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT) || 587,
-  secure: false,
+  port: Number(process.env.SMTP_PORT) || 465,
+  secure: true,   // 465 ke liye true hona chahiye
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
