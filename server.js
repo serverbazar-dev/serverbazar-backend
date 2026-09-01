@@ -520,6 +520,15 @@ paymentGateway: { type: String, enum: ["razorpay", "cashfree", "wallet"], defaul
   }
 );
 const PendingPayment = mongoose.model("PendingPayment", pendingPaymentSchema);
+// ==================== PASSWORD RESET OTP SCHEMA ====================
+// 10 min me khud delete ho jayega (TTL index) — jaisa PendingPayment karta hai
+const passwordResetOtpSchema = new mongoose.Schema({
+  email: { type: String, required: true, lowercase: true },
+  otpHash: { type: String, required: true },
+  attempts: { type: Number, default: 0 },
+  createdAt: { type: Date, default: Date.now, expires: 600 },
+});
+const PasswordResetOtp = mongoose.model("PasswordResetOtp", passwordResetOtpSchema);
 // ==================== NOTICE SCHEMA ====================
 const noticeSchema = new mongoose.Schema(
   {
@@ -914,14 +923,58 @@ app.put("/api/auth/change-password", protect, async (req, res) => {
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
+// ---------- STEP A: OTP BHEJO (email par) ----------
+app.post("/api/auth/forgot-password/send-otp", authLimiter, async (req, res) => {
+  try {
+    const { email, phone } = req.body;
+
+    if (typeof email !== "string" || typeof phone !== "string") {
+      return res.status(400).json({ message: "Invalid input format." });
+    }
+
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    const genericFail = "Email ya phone number match nahi hua.";
+
+    if (!user || !user.phone) {
+      return res.status(400).json({ message: genericFail });
+    }
+
+    const normalize = (p) => String(p).replace(/[^0-9]/g, "").slice(-10);
+    if (normalize(user.phone) !== normalize(phone)) {
+      return res.status(400).json({ message: genericFail });
+    }
+
+    // Purana OTP hata do (agar tha), naya banao
+    await PasswordResetOtp.deleteMany({ email: user.email });
+
+    const otp = String(crypto.randomInt(100000, 999999)); // 6-digit random OTP
+    const otpHash = crypto.createHash("sha256").update(otp).digest("hex");
+    await PasswordResetOtp.create({ email: user.email, otpHash });
+
+    try {
+      await sendOtpEmail(user.email, otp);
+    } catch (mailErr) {
+      console.error("OTP email bhejne me error:", mailErr.message);
+      return res.status(500).json({ message: "OTP email bhejne me error aaya. Baad me try karo." });
+    }
+
+    res.json({ message: "OTP aapke email par bhej diya gaya hai." });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ---------- STEP B: OTP VERIFY KARO + NAYA PASSWORD SET KARO ----------
 app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
   try {
-    const { email, phone, newPassword } = req.body;
+    const { email, phone, otp, newPassword } = req.body;
 
-    if (!email || !phone || !newPassword) {
-      return res.status(400).json({ message: "Email, phone aur naya password sab bharo." });
-    }
-    if (typeof email !== "string" || typeof phone !== "string" || typeof newPassword !== "string") {
+    if (
+      typeof email !== "string" ||
+      typeof phone !== "string" ||
+      typeof otp !== "string" ||
+      typeof newPassword !== "string"
+    ) {
       return res.status(400).json({ message: "Invalid input format." });
     }
     if (newPassword.length < 6) {
@@ -940,8 +993,25 @@ app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
       return res.status(400).json({ message: genericFail });
     }
 
+    const record = await PasswordResetOtp.findOne({ email: user.email });
+    if (!record) {
+      return res.status(400).json({ message: "OTP expire ho gaya ya bheja nahi gaya. Dobara OTP mangwao." });
+    }
+    if (record.attempts >= 5) {
+      await record.deleteOne();
+      return res.status(400).json({ message: "Bahut zyada galat attempts. Dobara OTP mangwao." });
+    }
+
+    const otpHash = crypto.createHash("sha256").update(otp).digest("hex");
+    if (otpHash !== record.otpHash) {
+      record.attempts += 1;
+      await record.save();
+      return res.status(400).json({ message: "OTP galat hai." });
+    }
+
     user.password = await bcrypt.hash(newPassword, 10);
     await user.save();
+    await record.deleteOne();
 
     res.json({ message: "Password successfully reset ho gaya! Ab login karo." });
   } catch (err) {
