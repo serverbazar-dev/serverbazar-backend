@@ -12,30 +12,33 @@ const rateLimit = require("express-rate-limit");
 const { NodeSSH } = require("node-ssh");
 
 dotenv.config();
-const nodemailer = require("nodemailer");
-
-const mailTransporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT) || 465,
-  secure: true,   // 465 ke liye true hona chahiye
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-});
-
-mailTransporter.verify((err) => {
-  if (err) console.error("SMTP connection fail ❌", err.message);
-  else console.log("SMTP ready ✅ — emails bhejne ke liye taiyaar");
-});
 
 async function sendOtpEmail(toEmail, otp) {
-  await mailTransporter.sendMail({
-    from: process.env.SMTP_FROM,
-    to: toEmail,
-    subject: "ServerBazar - Password Reset OTP",
-    html: `<p>Aapka OTP hai: <b style="font-size:20px">${otp}</b></p><p>Ye 10 minute me expire ho jayega. Agar aapne request nahi ki, ignore karo.</p>`,
+  const response = await fetch("https://api.elasticemail.com/v4/emails", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-ElasticEmail-ApiKey": process.env.ELASTIC_EMAIL_API_KEY,
+    },
+    body: JSON.stringify({
+      Recipients: [{ Email: toEmail }],
+      Content: {
+        Subject: "ServerBazar - Password Reset OTP",
+        From: process.env.ELASTIC_EMAIL_FROM,
+        Body: [
+          {
+            ContentType: "HTML",
+            Content: `<p>Aapka OTP hai: <b style="font-size:20px">${otp}</b></p><p>Ye 10 minute me expire ho jayega. Agar aapne request nahi ki, ignore karo.</p>`,
+          },
+        ],
+      },
+    }),
   });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Elastic Email error: ${errText}`);
+  }
 }
 
 const { Cashfree, CFEnvironment } = require("cashfree-pg");
