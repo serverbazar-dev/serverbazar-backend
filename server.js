@@ -142,6 +142,46 @@ async function getVmOverviewCached() {
 }
 // ==================== END HOSTHEAVEN CONFIG ====================
 
+// ==================== OCEANSMART (OceanVPS) CONFIG ====================
+const OCEANSMART_BASE = "https://smartvps.store";
+const OCEANSMART_AUTH =
+  "Basic " +
+  Buffer.from(`${process.env.OCEANSMART_USERNAME}:${process.env.OCEANSMART_PASSWORD}`).toString("base64");
+
+async function oceanSmartAPI(endpoint, method = "POST", body = null) {
+  const headers = {
+    "Content-Type": "application/json",
+    "Authorization": OCEANSMART_AUTH,
+  };
+  const opts = { method, headers };
+  if (body) opts.body = JSON.stringify(body);
+
+  const res = await fetch(`${OCEANSMART_BASE}${endpoint}`, opts);
+  const text = await res.text();
+  try {
+    return { ok: res.ok, status: res.status, data: JSON.parse(text) };
+  } catch {
+    return { ok: res.ok, status: res.status, data: text };
+  }
+}
+
+const oceanSmart = {
+  start: (ip) => oceanSmartAPI("/api/oceansmart/start", "POST", { ip }),
+  stop: (ip) => oceanSmartAPI("/api/oceansmart/stop", "POST", { ip }),
+  format: (ip) => oceanSmartAPI("/api/oceansmart/format", "POST", { ip }), // ⚠️ provider se confirm karo
+  status: (ip) => oceanSmartAPI("/api/oceansmart/status", "POST", { ip }),
+  changeOS: (ip, os) => oceanSmartAPI("/api/oceansmart/changeos", "POST", { ip, os }),
+  ipStock: () => oceanSmartAPI("/api/oceansmart/ipstock", "GET"),
+  buyVps: (ip, ram) => oceanSmartAPI("/api/oceansmart/buyvps", "POST", { ip, ram }),
+  renewVps: (ip) => oceanSmartAPI("/api/oceansmart/renewvps", "POST", { ip }),
+  getOsTemplate: (ip) => oceanSmartAPI("/api/oceansmart/getostemplate", "POST", { ip }),
+};
+
+async function findOwnedOrderByIp(userId, ip) {
+  return Order.findOne({ user: userId, deliveryIp: ip, vpsProvider: "oceansmart" });
+}
+// ==================== END OCEANSMART CONFIG ====================
+
 const app = express();
 
 const allowedOrigins = [
@@ -455,7 +495,8 @@ paymentGateway: { type: String, enum: ["razorpay", "cashfree", "wallet"], defaul
     formatReason: { type: String },
 formatSolution: { type: String },
 formatSeenByUser: { type: Boolean, default: true },
-vmId: { type: Number, default: null },
+    vmId: { type: Number, default: null },
+    vpsProvider: { type: String, enum: ["manual", "hostheaven", "oceansmart"], default: "manual" }, // ✅ NAYA
   },
   { timestamps: true }
 );
@@ -1779,6 +1820,139 @@ app.get("/api/admin/hostheaven-live-vms", protect, isAdmin, async (req, res) => 
   }
 });
 // ==================== END HOSTHEAVEN ROUTES ====================
+// ==================== OCEANSMART ROUTES (USER) ====================
+app.post("/api/vps/oceansmart-control", protect, async (req, res) => {
+  try {
+    const { ip, action } = req.body; // action: "start" | "stop" | "format" | "status"
+    if (!ip || !["start", "stop", "format", "status"].includes(action)) {
+      return res.status(400).json({ success: false, message: "ip aur valid action zaroori hai." });
+    }
+    const order = await findOwnedOrderByIp(req.userId, ip);
+    if (!order) {
+      return res.status(403).json({ success: false, message: "Ye VPS aapka nahi hai." });
+    }
+    const result = await oceanSmart[action](ip);
+    res.json({ success: result.ok, data: result.data });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.post("/api/vps/oceansmart-change-os", protect, async (req, res) => {
+  try {
+    const { ip, os } = req.body;
+    const allowedOS = ["2012", "2016", "2019", "2022", "11", "centos", "ubuntu"];
+    if (!ip || !allowedOS.includes(os)) {
+      return res.status(400).json({ success: false, message: "ip aur valid os zaroori hai." });
+    }
+    const order = await findOwnedOrderByIp(req.userId, ip);
+    if (!order) {
+      return res.status(403).json({ success: false, message: "Ye VPS aapka nahi hai." });
+    }
+    const result = await oceanSmart.changeOS(ip, os);
+    if (result.ok) {
+      order.deliveryOS = os;
+      await order.save();
+    }
+    res.json({ success: result.ok, data: result.data });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.get("/api/vps/oceansmart-os-templates/:ip", protect, async (req, res) => {
+  try {
+    const { ip } = req.params;
+    const order = await findOwnedOrderByIp(req.userId, ip);
+    if (!order) {
+      return res.status(403).json({ success: false, message: "Ye VPS aapka nahi hai." });
+    }
+    const result = await oceanSmart.getOsTemplate(ip);
+    res.json({ success: result.ok, data: result.data });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+// ---------- MERI SAARI OCEANSMART VPS (LOGIN REQUIRED) ----------
+app.get("/api/vps/my-oceansmart-vps", protect, async (req, res) => {
+  try {
+    const orders = await Order.find({
+      user: req.userId,
+      vpsProvider: "oceansmart",
+      deliveryIp: { $ne: null },
+    }).sort({ createdAt: -1 });
+
+    if (!orders.length) return res.json({ success: true, vms: [] });
+
+    const results = await Promise.allSettled(
+      orders.map((o) => oceanSmart.status(o.deliveryIp))
+    );
+
+    const vms = orders.map((o, i) => {
+      const result = results[i];
+      const liveStatus =
+        result.status === "fulfilled" && result.value.ok
+          ? result.value.data
+          : null;
+
+      return {
+        orderId: o._id,
+        ip: o.deliveryIp,
+        planName: o.nameOrIp || o.planName,
+        ram: o.ram,
+        os: o.deliveryOS || "",
+        deliveryUsername: o.deliveryUsername,
+        deliveryPassword: o.deliveryPassword,
+        deliveryPort: o.deliveryPort,
+        status: o.status,
+        expiresAt: o.expiresAt,
+        liveStatus,
+      };
+    });
+
+    res.json({ success: true, vms });
+  } catch (err) {
+    res.json({ success: false, vms: [], message: err.message });
+  }
+});
+// ==================== END OCEANSMART ROUTES (USER) ====================
+// ==================== OCEANSMART ROUTES (ADMIN) ====================
+app.get("/api/admin/oceansmart-ipstock", protect, isAdmin, async (req, res) => {
+  try {
+    const result = await oceanSmart.ipStock();
+    res.json({ success: result.ok, data: result.data });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.post("/api/admin/oceansmart-buy", protect, isAdmin, async (req, res) => {
+  try {
+    const { ip, ram, orderId } = req.body;
+    if (!ip || !ram) {
+      return res.status(400).json({ success: false, message: "ip aur ram zaroori hai." });
+    }
+    const result = await oceanSmart.buyVps(ip, Number(ram));
+    if (result.ok && orderId) {
+      await Order.findByIdAndUpdate(orderId, { deliveryIp: ip });
+    }
+    res.json({ success: result.ok, data: result.data });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.post("/api/admin/oceansmart-renew", protect, isAdmin, async (req, res) => {
+  try {
+    const { ip } = req.body;
+    if (!ip) return res.status(400).json({ success: false, message: "ip zaroori hai." });
+    const result = await oceanSmart.renewVps(ip);
+    res.json({ success: result.ok, data: result.data });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+// ==================== END OCEANSMART ROUTES (ADMIN) ====================
 // ==================== WALLET ROUTES ====================
 
 // ---------- BALANCE DEKHO ----------
@@ -2135,7 +2309,7 @@ app.get("/api/admin/reports/revenue/day", protect, isAdmin, async (req, res) => 
 
 app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
   try {
-    const { status, deliveryIp, deliveryPort, deliveryUsername, deliveryPassword, deliveryOS, validityDays } = req.body;
+    const { status, deliveryIp, deliveryPort, deliveryUsername, deliveryPassword, deliveryOS, validityDays, vpsProvider } = req.body;
 
     const existingOrder = await Order.findById(req.params.id);
     if (!existingOrder) {
@@ -2143,7 +2317,8 @@ app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
     }
 
     const updateFields = {};
-    if (req.body.vmId !== undefined) updateFields.vmId = Number(req.body.vmId) || null;
+        if (req.body.vmId !== undefined) updateFields.vmId = Number(req.body.vmId) || null;
+    if (vpsProvider !== undefined) updateFields.vpsProvider = vpsProvider; // ✅ NAYA
     if (status !== undefined) updateFields.status = status;
     if (deliveryIp !== undefined) updateFields.deliveryIp = deliveryIp;
         if (deliveryPort !== undefined) updateFields.deliveryPort = deliveryPort;
