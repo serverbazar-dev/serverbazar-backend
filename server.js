@@ -143,7 +143,7 @@ async function getVmOverviewCached() {
 // ==================== END HOSTHEAVEN CONFIG ====================
 
 // ==================== OCEANSMART (OceanVPS) CONFIG ====================
-const OCEANSMART_BASE = "https://smartvps.store";
+const OCEANSMART_BASE = "https://smartvps.online";
 const OCEANSMART_AUTH =
   "Basic " +
   Buffer.from(`${process.env.OCEANSMART_USERNAME}:${process.env.OCEANSMART_PASSWORD}`).toString("base64");
