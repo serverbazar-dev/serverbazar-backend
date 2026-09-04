@@ -477,6 +477,7 @@ const vpsPlanSchema = new mongoose.Schema(
     available: { type: Boolean, default: true },
     bestSeller: { type: Boolean, default: false }, // admin manually marks this as "Most Demanded"
     category: { type: String, enum: ["vps", "linux"], default: "vps" }, // "vps" ya "linux"
+    sortOrder: { type: Number, default: 0 },
   },
   { timestamps: true }
 );
@@ -1029,7 +1030,7 @@ app.get("/api/vps/plans", async (req, res) => {
   try {
     const category = req.query.category === "linux" ? "linux" : "vps";
     // available: true hatao — saare plans aayenge
-    const plans = await VpsPlan.find({ category }).sort({ createdAt: -1 });
+    const plans = await VpsPlan.find({ category }).sort({ sortOrder: 1, createdAt: -1 });
     res.json(plans);
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
@@ -2249,7 +2250,7 @@ app.get("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
     if (req.query.category === "vps" || req.query.category === "linux") {
       filter.category = req.query.category;
     }
-    const plans = await VpsPlan.find(filter).sort({ createdAt: -1 });
+    const plans = await VpsPlan.find(filter).sort({ sortOrder: 1, createdAt: -1 });
     res.json(plans);
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
@@ -2320,6 +2321,25 @@ app.delete("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
       return res.status(404).json({ message: "Plan nahi mila." });
     }
     res.json({ message: "Plan delete ho gaya." });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+app.put("/api/admin/vps-plans/reorder", protect, isAdmin, async (req, res) => {
+  try {
+    const { order } = req.body;
+    if (!Array.isArray(order) || order.length === 0) {
+      return res.status(400).json({ message: "Order list zaroori hai." });
+    }
+    const bulkOps = order.map((item) => ({
+      updateOne: {
+        filter: { _id: item.id },
+        update: { $set: { sortOrder: Number(item.sortOrder) } },
+      },
+    }));
+    await VpsPlan.bulkWrite(bulkOps);
+    res.json({ message: "Order save ho gaya!" });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
