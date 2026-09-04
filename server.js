@@ -2285,6 +2285,25 @@ app.post("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
   }
 });
 
+app.put("/api/admin/vps-plans/reorder", protect, isAdmin, async (req, res) => {
+  try {
+    const { order } = req.body;
+    if (!Array.isArray(order) || order.length === 0) {
+      return res.status(400).json({ message: "Order list zaroori hai." });
+    }
+    const bulkOps = order.map((item) => ({
+      updateOne: {
+        filter: { _id: item.id },
+        update: { $set: { sortOrder: Number(item.sortOrder) } },
+      },
+    }));
+    await VpsPlan.bulkWrite(bulkOps);
+    res.json({ message: "Order save ho gaya!" });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+})
+
 app.put("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
   try {
     const { nameOrIp, label, company, ramOptions, available, bestSeller, category } = req.body;
@@ -2326,24 +2345,7 @@ app.delete("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
   }
 });
 
-app.put("/api/admin/vps-plans/reorder", protect, isAdmin, async (req, res) => {
-  try {
-    const { order } = req.body;
-    if (!Array.isArray(order) || order.length === 0) {
-      return res.status(400).json({ message: "Order list zaroori hai." });
-    }
-    const bulkOps = order.map((item) => ({
-      updateOne: {
-        filter: { _id: item.id },
-        update: { $set: { sortOrder: Number(item.sortOrder) } },
-      },
-    }));
-    await VpsPlan.bulkWrite(bulkOps);
-    res.json({ message: "Order save ho gaya!" });
-  } catch (err) {
-    res.status(500).json({ message: "Server error", error: err.message });
-  }
-});
+
 // ---------- ADMIN: EK SPECIFIC RAM OPTION KA STOCK TOGGLE KARO ----------
 app.put("/api/admin/vps-plans/:id/ram-stock", protect, isAdmin, async (req, res) => {
   try {
