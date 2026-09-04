@@ -168,13 +168,13 @@ async function oceanSmartAPI(endpoint, method = "POST", body = null) {
 const oceanSmart = {
   start: (ip) => oceanSmartAPI("/api/oceansmart/start", "POST", { ip }),
   stop: (ip) => oceanSmartAPI("/api/oceansmart/stop", "POST", { ip }),
-  format: (ip) => oceanSmartAPI("/api/oceansmart/format", "POST", { ip }), // ⚠️ provider se confirm karo
+  format: (ip) => oceanSmartAPI("/api/oceansmart/format", "POST", { ip }),
   status: (ip) => oceanSmartAPI("/api/oceansmart/status", "POST", { ip }),
   changeOS: (ip, os) => oceanSmartAPI("/api/oceansmart/changeos", "POST", { ip, os }),
   ipStock: () => oceanSmartAPI("/api/oceansmart/ipstock", "GET"),
-  buyVps: (ip, ram) => oceanSmartAPI("/api/oceansmart/buyvps", "POST", { ip, ram }),
+  buyVps: (ip, ram) => oceanSmartAPI("/api/oceansmart/buyvps", "POST", { ip, ram: Number(ram) }), // ✅ SIRF YE CHANGE
   renewVps: (ip) => oceanSmartAPI("/api/oceansmart/renewvps", "POST", { ip }),
-  getOsTemplate: (ip) => oceanSmartAPI("/api/oceansmart/getostemplate", "POST", { ip }),
+  getOsTemplate: (ip) => oceanSmartAPI("/api/oceansmart/getosetemplate", "POST", { ip }), // ✅ SIRF YE CHANGE
 };
 
 async function findOwnedOrderByIp(userId, ip) {
@@ -1823,7 +1823,7 @@ app.get("/api/admin/hostheaven-live-vms", protect, isAdmin, async (req, res) => 
 // ==================== OCEANSMART ROUTES (USER) ====================
 app.post("/api/vps/oceansmart-control", protect, async (req, res) => {
   try {
-    const { ip, action } = req.body; // action: "start" | "stop" | "format" | "status"
+    const { ip, action } = req.body;
     if (!ip || !["start", "stop", "format", "status"].includes(action)) {
       return res.status(400).json({ success: false, message: "ip aur valid action zaroori hai." });
     }
@@ -1832,7 +1832,16 @@ app.post("/api/vps/oceansmart-control", protect, async (req, res) => {
       return res.status(403).json({ success: false, message: "Ye VPS aapka nahi hai." });
     }
     const result = await oceanSmart[action](ip);
-    res.json({ success: result.ok, data: result.data });
+    
+    // ✅ YE 4 LINES ADD KARO
+    if (!result.ok) {
+      return res.status(result.status || 500).json({ 
+        success: false, 
+        message: typeof result.data === 'string' ? result.data : 'OceanSmart API error'
+      });
+    }
+    
+    res.json({ success: true, data: result.data });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -1934,7 +1943,10 @@ app.post("/api/admin/oceansmart-buy", protect, isAdmin, async (req, res) => {
     }
     const result = await oceanSmart.buyVps(ip, Number(ram));
     if (result.ok && orderId) {
-      await Order.findByIdAndUpdate(orderId, { deliveryIp: ip });
+      await Order.findByIdAndUpdate(orderId, { 
+        deliveryIp: ip,
+        vpsProvider: "oceansmart" // ✅ YE LINE ADD KARO
+      });
     }
     res.json({ success: result.ok, data: result.data });
   } catch (err) {
@@ -1944,9 +1956,17 @@ app.post("/api/admin/oceansmart-buy", protect, isAdmin, async (req, res) => {
 
 app.post("/api/admin/oceansmart-renew", protect, isAdmin, async (req, res) => {
   try {
-    const { ip } = req.body;
+    const { ip, orderId } = req.body; // ✅ orderId bhi lo
     if (!ip) return res.status(400).json({ success: false, message: "ip zaroori hai." });
     const result = await oceanSmart.renewVps(ip);
+    
+    // ✅ YE LINES ADD KARO
+    if (result.ok && orderId) {
+      await Order.findByIdAndUpdate(orderId, { 
+        expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // 30 days
+      });
+    }
+    
     res.json({ success: result.ok, data: result.data });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
