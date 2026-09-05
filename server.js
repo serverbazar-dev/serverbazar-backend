@@ -822,8 +822,8 @@ app.post("/api/auth/register", authLimiter, async (req, res) => {
     });
 
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
-      expiresIn: "7d",
-    });
+  expiresIn: "30m",
+});
 
     res.status(201).json({
       message: "Account ban gaya!",
@@ -863,8 +863,8 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
     }
 
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
-      expiresIn: "7d",
-    });
+  expiresIn: "30m",
+});
 
     res.json({
       message: "Login successful!",
