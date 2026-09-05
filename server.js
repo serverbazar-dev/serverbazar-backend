@@ -412,7 +412,7 @@ const userSchema = new mongoose.Schema(
     email: { type: String, required: true, unique: true, lowercase: true },
     password: { type: String, required: true },
     phone: { type: String },
-    role: { type: String, default: "user" },
+    role: { type: String, enum: ["user", "seller", "admin"], default: "user" },
   },
   { timestamps: true }
 );
@@ -471,6 +471,7 @@ const vpsPlanSchema = new mongoose.Schema(
       {
         ram: { type: String, required: true },
         price: { type: Number, required: true },
+        sellerPrice: { type: Number, default: null }, // seller ke liye special (kam) rate — optional
         available: { type: Boolean, default: true },
       },
     ],
@@ -682,6 +683,39 @@ function loadSecretCoupons() {
 }
 const SECRET_COUPONS = loadSecretCoupons();
 const SECRET_COUPON_PER_USER_LIMIT = 1; // har user isko sirf 1 baar use kar sakta hai
+
+// ==================== SELLER PRICE HELPER ====================
+// User ka role dekh kar sahi price return karta hai.
+// Seller ho AUR admin ne is RAM option ke liye sellerPrice set kiya ho, tabhi
+// sellerPrice milega — warna hamesha normal price hi milega (fail-safe default).
+function getEffectivePrice(ramOption, userRole) {
+  if (
+    userRole === "seller" &&
+    ramOption.sellerPrice != null &&
+    Number(ramOption.sellerPrice) > 0
+  ) {
+    return Number(ramOption.sellerPrice);
+  }
+  return Number(ramOption.price);
+}
+
+// Token ho to decode karke role attach karta hai, na ho ya invalid ho to bhi
+// aage badhne deta hai (kyunki /api/vps/plans public route hai, login zaroori nahi).
+async function optionalAuth(req, res, next) {
+  req.userRole = "user";
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    try {
+      const token = authHeader.split(" ")[1];
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const user = await User.findById(decoded.id).select("role");
+      if (user) req.userRole = user.role;
+    } catch (e) {
+      // invalid/expired token — chup chaap normal user maan lo, error mat do
+    }
+  }
+  next();
+}
 
 // ==================== COUPON HELPER ====================
 // Ek coupon code, plan price aur user ke against valid hai ya nahi check karta hai.
@@ -1026,12 +1060,23 @@ app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
 // ==================== VPS / LINUX PLAN ROUTES ====================
 // Dono categories ("vps" aur "linux") same routes use karte hain, sirf ?category= query se filter hota hai.
 
-app.get("/api/vps/plans", async (req, res) => {
+app.get("/api/vps/plans", optionalAuth, async (req, res) => {
   try {
     const category = req.query.category === "linux" ? "linux" : "vps";
-    // available: true hatao — saare plans aayenge
     const plans = await VpsPlan.find({ category }).sort({ sortOrder: 1, createdAt: -1 });
-    res.json(plans);
+
+    // Seller login hai to har RAM option ka price sellerPrice se replace karo,
+    // baaki sab (available, bestSeller, label) bilkul same rehta hai
+    const result = plans.map((plan) => {
+      const p = plan.toObject();
+      p.ramOptions = p.ramOptions.map((o) => ({
+        ...o,
+        price: getEffectivePrice(o, req.userRole),
+      }));
+      return p;
+    });
+
+    res.json(result);
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
@@ -1082,8 +1127,9 @@ app.post("/api/coupons/validate", couponLimiter, protect, async (req, res) => {
       return res.status(400).json({ message: "Ye RAM option abhi out of stock hai." });
     }
 
-        const currentUser = await User.findById(req.userId).select("email");
-    const result = await checkCouponValidity(code, selectedOption.price, req.userId, cat, currentUser?.email);
+        const currentUser = await User.findById(req.userId).select("email role");
+    const effectivePrice = getEffectivePrice(selectedOption, currentUser.role);
+    const result = await checkCouponValidity(code, effectivePrice, req.userId, cat, currentUser?.email);
 
     if (!result.valid) {
       logPurchaseActivity({
@@ -1095,7 +1141,7 @@ app.post("/api/coupons/validate", couponLimiter, protect, async (req, res) => {
 
     res.json({
       message: result.message,
-      originalPrice: selectedOption.price,
+      originalPrice: effectivePrice,
       discountAmount: result.discountAmount,
       finalAmount: result.finalAmount,
     });
@@ -1131,16 +1177,17 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
     }
 
     const user = await User.findById(req.userId);
+    const effectivePrice = getEffectivePrice(selectedOption, user.role);
 
     let discountAmount = 0;
-    let finalAmount = selectedOption.price;
+    let finalAmount = effectivePrice;
     let appliedCouponCode = undefined;
 
     // Coupon bheja gaya hai to server khud se dobara validate karega
     // (frontend ka discount kabhi trust nahi karna, warna koi bhi manually price ghata sakta hai)
     
     if (couponCode) {
-      const result = await checkCouponValidity(couponCode, selectedOption.price, req.userId, cat, user?.email);
+      const result = await checkCouponValidity(couponCode, effectivePrice, req.userId, cat, user?.email);
       if (!result.valid) {
         logPurchaseActivity({ user: req.userId, category: cat, vpsId, nameOrIp: plan.nameOrIp, ram: selectedOption.ram, stage: "create-payment", status: "failed", message: result.message });
         return res.status(400).json({ message: result.message });
@@ -1172,7 +1219,7 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
           vpsId: plan.vpsId,
           nameOrIp: plan.nameOrIp,
           ram: selectedOption.ram,
-          price: selectedOption.price,
+          price: effectivePrice,
           couponCode: appliedCouponCode,
           discountAmount,
           finalAmount,
@@ -1237,7 +1284,7 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
         nameOrIp: plan.nameOrIp,
         planName: plan.label || plan.nameOrIp,
         ram: selectedOption.ram,
-        price: selectedOption.price,
+        price: effectivePrice,
         couponCode: appliedCouponCode,
         discountAmount,
         finalAmount,
@@ -1270,7 +1317,7 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
       nameOrIp: plan.nameOrIp,
       planName: plan.label || plan.nameOrIp,
       ram: selectedOption.ram,
-      price: selectedOption.price,
+      price: effectivePrice,
       couponCode: appliedCouponCode,
       discountAmount,
       finalAmount,
@@ -2048,6 +2095,26 @@ app.get("/api/admin/users", protect, isAdmin, async (req, res) => {
   try {
     const users = await User.find().select("-password").sort({ createdAt: -1 });
     res.json(users);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+// ---------- ADMIN: USER KA ROLE CHANGE KARO (user / seller / admin) ----------
+app.put("/api/admin/users/:id/role", protect, isAdmin, async (req, res) => {
+  try {
+    const { role } = req.body;
+    if (!["user", "seller", "admin"].includes(role)) {
+      return res.status(400).json({ message: "Invalid role." });
+    }
+    const user = await User.findByIdAndUpdate(
+      req.params.id,
+      { role },
+      { new: true }
+    ).select("-password");
+    if (!user) {
+      return res.status(404).json({ message: "User nahi mila." });
+    }
+    res.json({ message: "Role update ho gaya.", user });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
