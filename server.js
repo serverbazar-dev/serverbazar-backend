@@ -2099,21 +2099,24 @@ app.get("/api/admin/users", protect, isAdmin, async (req, res) => {
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
-// ---------- ADMIN: USER KA ROLE CHANGE KARO (user / seller / admin) ----------
+// ---------- ADMIN: USER KA ROLE CHANGE KARO (sirf user / seller — admin is route se KABHI nahi ban sakta) ----------
 app.put("/api/admin/users/:id/role", protect, isAdmin, async (req, res) => {
   try {
     const { role } = req.body;
-    if (!["user", "seller", "admin"].includes(role)) {
-      return res.status(400).json({ message: "Invalid role." });
+    if (!["user", "seller"].includes(role)) {
+      return res.status(400).json({ message: "Is route se sirf 'user' ya 'seller' role set kar sakte ho." });
     }
-    const user = await User.findByIdAndUpdate(
-      req.params.id,
-      { role },
-      { new: true }
-    ).select("-password");
-    if (!user) {
+    const targetUser = await User.findById(req.params.id);
+    if (!targetUser) {
       return res.status(404).json({ message: "User nahi mila." });
     }
+    // Kisi existing admin ka role bhi is route se change nahi hone dena
+    if (targetUser.role === "admin") {
+      return res.status(403).json({ message: "Admin ka role is route se change nahi ho sakta." });
+    }
+    targetUser.role = role;
+    await targetUser.save();
+    const user = await User.findById(targetUser._id).select("-password");
     res.json({ message: "Role update ho gaya.", user });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
