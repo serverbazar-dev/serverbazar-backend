@@ -164,10 +164,10 @@ app.use(cors({
 }));
 
 app.use(express.json());
-// Login/Register ke liye limiter — 15 min me max 10 tries per IP
+// Login/Register ke liye limiter — 15 min me max 30 tries per IP
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 10,
+  max: 30,
   message: { message: "Bahut zyada attempts ho gaye. 15 minute baad try karo." },
 });
 
