@@ -163,7 +163,11 @@ app.use(cors({
   credentials: true,
 }));
 
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
 // Login/Register ke liye limiter — 15 min me max 30 tries per IP
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -1163,6 +1167,18 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
     if (!plan) {
       logPurchaseActivity({ user: req.userId, category: cat, vpsId, stage: "create-payment", status: "failed", message: "Plan nahi mila." });
       return res.status(404).json({ message: "Plan nahi mila." });
+    }
+    if (plan.available === false) {
+      logPurchaseActivity({
+        user: req.userId,
+        category: cat,
+        vpsId,
+        nameOrIp: plan.nameOrIp,
+        stage: "create-payment",
+        status: "failed",
+        message: "Plan (poora) out of stock tha.",
+      });
+      return res.status(400).json({ message: "Ye plan abhi out of stock hai." });
     }
 
     // Price hamesha server se lo, frontend se kabhi trust mat karo
@@ -2614,6 +2630,96 @@ app.put("/api/admin/notices/:id", protect, isAdmin, async (req, res) => {
     res.json({ message: "Notice update ho gaya.", notice });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ==================== RAZORPAY WEBHOOK (SERVER-TO-SERVER CONFIRMATION) ====================
+app.post("/api/webhooks/razorpay", async (req, res) => {
+  try {
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    const signature = req.headers["x-razorpay-signature"];
+
+    if (!webhookSecret || !signature || !req.rawBody) {
+      return res.status(400).json({ message: "Webhook signature missing." });
+    }
+
+    const expectedSignature = crypto
+      .createHmac("sha256", webhookSecret)
+      .update(req.rawBody)
+      .digest("hex");
+
+    if (expectedSignature !== signature) {
+      console.error("Razorpay webhook: signature mismatch, ignore kar rahe hain.");
+      return res.status(400).json({ message: "Invalid signature." });
+    }
+
+    const event = req.body.event;
+    if (event !== "payment.captured") {
+      return res.status(200).json({ message: "Event ignored." });
+    }
+
+    const paymentEntity = req.body.payload?.payment?.entity;
+    if (!paymentEntity) {
+      return res.status(200).json({ message: "No payment entity." });
+    }
+
+    const razorpay_order_id = paymentEntity.order_id;
+    const razorpay_payment_id = paymentEntity.id;
+
+    const alreadyExists = await Order.findOne({ razorpayPaymentId: razorpay_payment_id });
+    if (alreadyExists) {
+      return res.status(200).json({ message: "Order already exists." });
+    }
+
+    const pending = await PendingPayment.findOneAndDelete({ razorpayOrderId: razorpay_order_id });
+    if (!pending) {
+      console.warn(`Webhook: pending record nahi mila order ${razorpay_order_id} ke liye. Manual check karo.`);
+      return res.status(200).json({ message: "Pending record not found." });
+    }
+
+    const expectedAmountInPaise = Math.round(pending.finalAmount * 100);
+    if (paymentEntity.amount !== expectedAmountInPaise) {
+      console.error(`Webhook: amount mismatch order ${razorpay_order_id} ke liye.`);
+      return res.status(200).json({ message: "Amount mismatch." });
+    }
+
+    const order = await Order.create({
+      user: pending.user,
+      planName: pending.planName,
+      category: pending.category,
+      vpsId: pending.vpsId,
+      nameOrIp: pending.nameOrIp,
+      ram: pending.ram,
+      price: pending.price,
+      couponCode: pending.couponCode,
+      discountAmount: pending.discountAmount,
+      finalAmount: pending.finalAmount,
+      status: "pending",
+      razorpayOrderId: razorpay_order_id,
+      razorpayPaymentId: razorpay_payment_id,
+      paymentStatus: "paid",
+    });
+
+    if (pending.couponCode) {
+      await Coupon.updateOne({ code: pending.couponCode }, { $inc: { usedCount: 1 } });
+    }
+
+    logPurchaseActivity({
+      user: pending.user, category: pending.category, vpsId: pending.vpsId,
+      nameOrIp: pending.nameOrIp, ram: pending.ram, gateway: "razorpay",
+      stage: "verify-payment", status: "success",
+      message: "Payment confirm ✅ (webhook se)", amount: pending.finalAmount,
+    });
+
+    try {
+      const orderedByUser = await User.findById(order.user).select("name email");
+      sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
+    } catch (e) {}
+
+    res.status(200).json({ message: "Order created via webhook." });
+  } catch (err) {
+    console.error("Razorpay webhook error:", err.message);
+    res.status(500).json({ message: "Webhook processing error." });
   }
 });
 
