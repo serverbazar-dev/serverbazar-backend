@@ -140,41 +140,6 @@ async function getVmOverviewCached() {
   vmOverviewCacheTime = now;
   return data;
 }
-function generateStrongPassword() {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%";
-  let pw = "";
-  for (let i = 0; i < 14; i++) pw += chars[crypto.randomInt(chars.length)];
-  return pw;
-}
-
-async function autoProvisionOrderFromHostHeaven(order, vmId) {
-  const details = await hostHeavenAPI(`/api/users/orders/${vmId}/details`);
-  if (!details || !details.ipAddress) {
-    throw new Error("HostHeaven se VM details nahi mile. vmId check karo.");
-  }
-
-  const isWindows = /win/i.test(details.vmName || order.deliveryOS || "");
-  const username = isWindows ? "Administrator" : "root";
-  const os = isWindows ? "Windows Server" : (order.deliveryOS || "Ubuntu 22.04");
-
-  const newPassword = generateStrongPassword();
-  await hostHeavenAPI(`/api/users/${hostHeavenUserId}/vms/${vmId}/password`, "PUT", {
-    password: newPassword,
-  });
-
-  order.vmId = vmId;
-  order.deliveryIp = details.ipAddress;
-  order.deliveryUsername = username;
-  order.deliveryPassword = newPassword;
-  order.deliveryOS = os;
-  order.status = "delivered";
-  if (!order.deliveredAt) order.deliveredAt = new Date();
-  const days = order.validityDays || 30;
-  order.expiresAt = new Date(order.deliveredAt.getTime() + days * 24 * 60 * 60 * 1000);
-  await order.save();
-
-  return order;
-}
 // ==================== END HOSTHEAVEN CONFIG ====================
 
 const app = express();
@@ -1862,26 +1827,6 @@ app.get("/api/vps/hostheaven-lock-status/:vmId", protect, async (req, res) => {
     res.json({ success: true, isLocked, status: data.status || "" });
   } catch (err) {
     res.json({ success: false, isLocked: false });
-  }
-});
-app.post("/api/admin/orders/:id/auto-provision", protect, isAdmin, async (req, res) => {
-  try {
-    const { vmId } = req.body;
-    if (!vmId) return res.status(400).json({ message: "vmId zaroori hai." });
-
-    const order = await Order.findById(req.params.id);
-    if (!order) return res.status(404).json({ message: "Order nahi mila." });
-
-    const updated = await autoProvisionOrderFromHostHeaven(order, Number(vmId));
-
-    try {
-      const orderedByUser = await User.findById(updated.user).select("name email");
-      sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order: updated }));
-    } catch (e) {}
-
-    res.json({ message: "VM auto-provision ho gaya! Password bhi set kar diya gaya.", order: updated });
-  } catch (err) {
-    res.status(500).json({ message: err.message || "Auto-provision fail ho gaya." });
   }
 });
 
