@@ -383,11 +383,11 @@ function sendTelegramMessage(text) {
 }
 
 // Naya order confirm hote hi admin ko bhejne wala message banata hai
-function buildOrderAlertMessage({ user, order }) {
+function buildOrderAlertMessage({ user, order, isManual = false }) {
   const categoryLabel = order.category === "linux" ? "🐧 Linux IP" : "🖥️ VPS";
 
   const lines = [
-    `🛒 <b>Naya Order Mila!</b>`,
+    isManual ? `🛠️ <b>Manual Order (Admin Created)</b>` : `🛒 <b>Naya Order Mila!</b>`,
     ``,
     `${categoryLabel} <b>Order</b>`,
     `👤 <b>Naam:</b> ${escapeHtml(user?.name)}`,
@@ -1606,7 +1606,7 @@ app.post("/api/admin/orders/manual-create", protect, isAdmin, async (req, res) =
         await session.commitTransaction();
         session.endSession();
 
-        try { sendTelegramMessage(buildOrderAlertMessage({ user: targetUser, order })); } catch (e) {}
+        try { sendTelegramMessage(buildOrderAlertMessage({ user: targetUser, order, isManual: true })); } catch (e) {}
 
         return res.status(201).json({ message: "Order manually create ho gaya (wallet se paisa kat gaya).", order });
       } catch (err) {
@@ -1626,7 +1626,7 @@ app.post("/api/admin/orders/manual-create", protect, isAdmin, async (req, res) =
       vmId: vmId ? Number(vmId) : null,
     });
 
-    try { sendTelegramMessage(buildOrderAlertMessage({ user: targetUser, order })); } catch (e) {}
+    try { sendTelegramMessage(buildOrderAlertMessage({ user: targetUser, order, isManual: true })); } catch (e) {}
 
     res.status(201).json({ message: "Order manually create ho gaya (bina payment ke).", order });
   } catch (err) {
