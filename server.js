@@ -2729,13 +2729,11 @@ app.post("/api/webhooks/razorpay", async (req, res) => {
     res.status(500).json({ message: "Webhook processing error." });
   }
 });
-
-// ==================== BASE ROUTE ====================
 app.get("/debug-hh-test", async (req, res) => {
   try {
     const result = await fetch(`${HOSTHEAVEN_BASE}/api/login`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Reseller-Domain": RESELLER_DOMAIN },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email: HOSTHEAVEN_EMAIL, password: HOSTHEAVEN_PASSWORD }),
     });
     const text = await result.text();
@@ -2744,6 +2742,8 @@ app.get("/debug-hh-test", async (req, res) => {
     res.send("ERROR: " + err.message);
   }
 });
+
+// ==================== BASE ROUTE ====================
 app.get("/", (req, res) => {
   res.send("ServerBazar API chal raha hai 🚀");
 });
