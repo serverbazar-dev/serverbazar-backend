@@ -1814,7 +1814,7 @@ function parseProxyLine(line) {
   return { ip, port: Number(port), username, password };
 }
 
-async function checkOneSite(proxy, targetUrl, timeoutMs = 10000) {
+async function checkOneSite(proxy, targetUrl, timeoutMs = 20000) {
   const proxyUrl = `http://${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@${proxy.ip}:${proxy.port}`;
   const agent = new HttpsProxyAgent(proxyUrl);
 
@@ -1823,6 +1823,7 @@ async function checkOneSite(proxy, targetUrl, timeoutMs = 10000) {
   const start = Date.now();
 
   try {
+    console.log("PROXY CHECK: trying", targetUrl, "via", proxy.ip + ":" + proxy.port);
     const r = await fetch(targetUrl, {
       agent,
       redirect: "follow",
@@ -1832,9 +1833,11 @@ async function checkOneSite(proxy, targetUrl, timeoutMs = 10000) {
       },
     });
     clearTimeout(timer);
+    console.log("PROXY CHECK: SUCCESS, status =", r.status);
     return { working: r.status >= 200 && r.status < 400, statusCode: r.status, latencyMs: Date.now() - start };
   } catch (err) {
     clearTimeout(timer);
+    console.error("PROXY CHECK ERROR:", err.code || err.name, "-", err.message);
     return {
       working: false,
       statusCode: null,
