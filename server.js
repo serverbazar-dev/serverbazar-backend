@@ -441,7 +441,7 @@ const orderSchema = new mongoose.Schema(
     razorpayPaymentId: { type: String },
     cfOrderId: { type: String },
 cfPaymentId: { type: String },
-paymentGateway: { type: String, enum: ["razorpay", "cashfree", "wallet"], default: "razorpay" },
+paymentGateway: { type: String, enum: ["razorpay", "cashfree", "wallet", "manual"], default: "razorpay" },
     paymentStatus: { type: String, default: "paid" }, // order sirf tabhi banta hai jab payment verify ho jaye
     // ---- delivery details (admin fill karega jab VPS actually deliver kare) ----
     deliveryIp: { type: String },
@@ -2727,6 +2727,111 @@ app.post("/api/webhooks/razorpay", async (req, res) => {
   } catch (err) {
     console.error("Razorpay webhook error:", err.message);
     res.status(500).json({ message: "Webhook processing error." });
+  }
+});
+
+// ---------- ADMIN: MANUAL ORDER CREATE (search user, deliver directly) ----------
+app.post("/api/admin/orders/manual-create", protect, isAdmin, async (req, res) => {
+  try {
+    const {
+      userEmail, category, planName, nameOrIp, ram, price,
+      deliveryIp, deliveryPort, deliveryUsername, deliveryPassword,
+      deliveryOS, validityDays, vmId, paymentMethod, reason,
+    } = req.body;
+
+    if (!userEmail || !planName || !price || !deliveryIp || !deliveryUsername || !deliveryPassword) {
+      return res.status(400).json({ message: "User email, plan, price, aur delivery details zaroori hain." });
+    }
+    if (!["wallet", "none"].includes(paymentMethod)) {
+      return res.status(400).json({ message: "Payment method 'wallet' ya 'none' hona chahiye." });
+    }
+
+    const targetUser = await User.findOne({ email: userEmail.toLowerCase().trim() });
+    if (!targetUser) {
+      return res.status(404).json({ message: "Is email ka user nahi mila." });
+    }
+
+    const cat = category === "linux" ? "linux" : "vps";
+    const numPrice = Number(price);
+    if (!numPrice || numPrice <= 0) {
+      return res.status(400).json({ message: "Price valid number hona chahiye." });
+    }
+    const days = Number(validityDays) > 0 ? Number(validityDays) : 30;
+    const deliveredAt = new Date();
+    const expiresAt = new Date(deliveredAt.getTime() + days * 24 * 60 * 60 * 1000);
+
+    const baseOrderData = {
+      user: targetUser._id,
+      planName: planName,
+      category: cat,
+      nameOrIp: nameOrIp || planName,
+      ram: ram || "-",
+      price: numPrice,
+      finalAmount: numPrice,
+      status: "delivered",
+      paymentStatus: "paid",
+      deliveryIp, deliveryPort, deliveryUsername, deliveryPassword, deliveryOS,
+      deliveredAt, validityDays: days, expiresAt,
+      vmId: vmId ? Number(vmId) : null,
+    };
+
+    let order;
+
+    if (paymentMethod === "wallet") {
+      const session = await mongoose.startSession();
+      try {
+        session.startTransaction();
+        const wallet = await Wallet.findOne({ user: targetUser._id }).session(session);
+        if (!wallet || wallet.balance < numPrice) {
+          await session.abortTransaction();
+          session.endSession();
+          return res.status(400).json({
+            message: `User ka wallet balance sirf ₹${wallet ? wallet.balance : 0} hai, itna deduct nahi ho sakta.`,
+          });
+        }
+        wallet.balance -= numPrice;
+        await wallet.save({ session });
+
+        const [createdOrder] = await Order.create([{ ...baseOrderData, paymentGateway: "wallet" }], { session });
+        order = createdOrder;
+
+        await WalletTransaction.create([{
+          user: targetUser._id,
+          type: "debit",
+          amount: numPrice,
+          description: `Admin Manual Order: ${reason ? reason.trim() : (nameOrIp || planName)}`,
+          orderId: order._id,
+          adminId: req.userId,
+          status: "completed",
+        }], { session });
+
+        await session.commitTransaction();
+        session.endSession();
+      } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+      }
+    } else {
+      order = await Order.create({ ...baseOrderData, paymentGateway: "manual" });
+    }
+
+    try {
+      sendTelegramMessage(
+        [
+          `🛠️ <b>Admin Manual Order Banaya!</b>`, ``,
+          `👤 <b>User:</b> ${escapeHtml(targetUser.name)} (${escapeHtml(targetUser.email)})`,
+          `🌐 <b>Plan/IP:</b> ${escapeHtml(nameOrIp || planName)}`,
+          `💳 <b>Payment:</b> ${paymentMethod === "wallet" ? `Wallet se ₹${numPrice} kata` : "Bina payment (Free/Manual)"}`,
+          `📝 <b>Reason:</b> ${escapeHtml(reason || "-")}`,
+          `🆔 <b>Order ID:</b> <code>${order._id}</code>`,
+        ].join("\n")
+      );
+    } catch (e) {}
+
+    res.status(201).json({ message: "Manual order create ho gaya aur user ke dashboard me deliver ho gaya!", order });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
   }
 });
 
