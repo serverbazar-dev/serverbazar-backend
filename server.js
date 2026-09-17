@@ -2749,6 +2749,15 @@ app.get("/debug-hh-test", async (req, res) => {
 });
 
 // ==================== BASE ROUTE ====================
+app.get("/my-current-ip", async (req, res) => {
+  try {
+    const r = await fetch("https://api.ipify.org?format=json");
+    const data = await r.json();
+    res.json(data);
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
 app.get("/", (req, res) => {
   res.send("ServerBazar API chal raha hai 🚀");
 });
