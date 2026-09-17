@@ -446,7 +446,7 @@ const orderSchema = new mongoose.Schema(
     razorpayPaymentId: { type: String },
     cfOrderId: { type: String },
 cfPaymentId: { type: String },
-paymentGateway: { type: String, enum: ["razorpay", "cashfree", "wallet"], default: "razorpay" },
+paymentGateway: { type: String, enum: ["razorpay", "cashfree", "wallet", "manual"], default: "razorpay" },
     paymentStatus: { type: String, default: "paid" }, // order sirf tabhi banta hai jab payment verify ho jaye
     // ---- delivery details (admin fill karega jab VPS actually deliver kare) ----
     deliveryIp: { type: String },
@@ -1540,6 +1540,109 @@ app.get("/api/vps/my-orders", protect, async (req, res) => {
     }
     const orders = await Order.find(filter).sort({ createdAt: -1 });
     res.json(orders);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+// ==================== ADMIN: MANUAL ORDER CREATE ====================
+app.post("/api/admin/orders/manual-create", protect, isAdmin, async (req, res) => {
+  try {
+    const {
+      email, category, nameOrIp, ram, price, paymentMethod,
+      deliveryIp, deliveryPort, deliveryUsername, deliveryPassword,
+      deliveryOS, validityDays, vmId,
+    } = req.body;
+
+    if (!email || !nameOrIp || !deliveryIp || !deliveryUsername || !deliveryPassword || !deliveryOS) {
+      return res.status(400).json({ message: "Email, Plan/IP, Server IP, Username, Password, OS — sab zaroori hai." });
+    }
+    if (!["wallet", "none"].includes(paymentMethod)) {
+      return res.status(400).json({ message: "Payment method 'wallet' ya 'none' hona chahiye." });
+    }
+
+    const targetUser = await User.findOne({ email: String(email).toLowerCase().trim() });
+    if (!targetUser) {
+      return res.status(404).json({ message: "Is email ka user nahi mila." });
+    }
+
+    const numPrice = Number(price) || 0;
+    const cat = category === "linux" ? "linux" : "vps";
+    const days = Number(validityDays) > 0 ? Number(validityDays) : 30;
+    const deliveredAt = new Date();
+    const expiresAt = new Date(deliveredAt.getTime() + days * 24 * 60 * 60 * 1000);
+
+    if (paymentMethod === "wallet") {
+      if (numPrice <= 0) {
+        return res.status(400).json({ message: "Wallet payment ke liye price 0 se zyada hona chahiye." });
+      }
+      const session = await mongoose.startSession();
+      try {
+        session.startTransaction();
+        const wallet = await Wallet.findOne({ user: targetUser._id }).session(session);
+        if (!wallet || wallet.balance < numPrice) {
+          await session.abortTransaction();
+          session.endSession();
+          return res.status(400).json({ message: `User ka wallet balance sirf ₹${wallet ? wallet.balance : 0} hai.` });
+        }
+        wallet.balance -= numPrice;
+        await wallet.save({ session });
+
+        const [order] = await Order.create([{
+          user: targetUser._id, planName: nameOrIp, category: cat,
+          vpsId: `manual_${Date.now()}`, nameOrIp, ram: ram || "-",
+          price: numPrice, finalAmount: numPrice, status: "delivered",
+          paymentGateway: "wallet", paymentStatus: "paid",
+          deliveryIp, deliveryPort, deliveryUsername, deliveryPassword, deliveryOS,
+          deliveredAt, validityDays: days, expiresAt,
+          vmId: vmId ? Number(vmId) : null,
+        }], { session });
+
+        await WalletTransaction.create([{
+          user: targetUser._id, type: "debit", amount: numPrice,
+          description: `Manual Admin Order: ${nameOrIp}`,
+          orderId: order._id, adminId: req.userId, status: "completed",
+        }], { session });
+
+        await session.commitTransaction();
+        session.endSession();
+
+        try { sendTelegramMessage(buildOrderAlertMessage({ user: targetUser, order })); } catch (e) {}
+
+        return res.status(201).json({ message: "Order manually create ho gaya (wallet se paisa kat gaya).", order });
+      } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        return res.status(500).json({ message: "Wallet deduct karte waqt error.", error: err.message });
+      }
+    }
+
+    const order = await Order.create({
+      user: targetUser._id, planName: nameOrIp, category: cat,
+      vpsId: `manual_${Date.now()}`, nameOrIp, ram: ram || "-",
+      price: numPrice, finalAmount: numPrice, status: "delivered",
+      paymentGateway: "manual", paymentStatus: "paid",
+      deliveryIp, deliveryPort, deliveryUsername, deliveryPassword, deliveryOS,
+      deliveredAt, validityDays: days, expiresAt,
+      vmId: vmId ? Number(vmId) : null,
+    });
+
+    try { sendTelegramMessage(buildOrderAlertMessage({ user: targetUser, order })); } catch (e) {}
+
+    res.status(201).json({ message: "Order manually create ho gaya (bina payment ke).", order });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ---------- ADMIN: EMAIL SUGGESTION KE LIYE USER SEARCH ----------
+app.get("/api/admin/users/search", protect, isAdmin, async (req, res) => {
+  try {
+    const q = (req.query.email || "").trim();
+    if (!q) return res.json([]);
+    const users = await User.find({ email: { $regex: q, $options: "i" } })
+      .select("name email phone role")
+      .limit(8);
+    res.json(users);
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
