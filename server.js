@@ -488,6 +488,7 @@ const vpsPlanSchema = new mongoose.Schema(
     bestSeller: { type: Boolean, default: false }, // admin manually marks this as "Most Demanded"
     category: { type: String, enum: ["vps", "linux"], default: "vps" }, // "vps" ya "linux"
     sortOrder: { type: Number, default: 0 },
+    isTrial: { type: Boolean, default: false },
   },
   { timestamps: true }
 );
@@ -2478,7 +2479,7 @@ app.get("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
 
 app.post("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
   try {
-    const { vpsId, nameOrIp, label, company, ramOptions, bestSeller, category } = req.body;
+    const { vpsId, nameOrIp, label, company, ramOptions, bestSeller, category, isTrial } = req.body;
 
     if (!vpsId || !nameOrIp || !ramOptions || ramOptions.length === 0) {
       return res.status(400).json({ message: "VPS ID, Name/IP aur kam se kam ek RAM option zaroori hai." });
@@ -2497,6 +2498,7 @@ app.post("/api/admin/vps-plans", protect, isAdmin, async (req, res) => {
       ramOptions,
       bestSeller: !!bestSeller,
       category: category === "linux" ? "linux" : "vps",
+      isTrial: !!isTrial,
     });
     res.status(201).json({ message: "Plan add ho gaya!", plan });
   } catch (err) {
@@ -2525,7 +2527,7 @@ app.put("/api/admin/vps-plans/reorder", protect, isAdmin, async (req, res) => {
 
 app.put("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
   try {
-    const { nameOrIp, label, company, ramOptions, available, bestSeller, category } = req.body;
+    const { nameOrIp, label, company, ramOptions, available, bestSeller, category, isTrial } = req.body;
 
     const updateFields = {};
     if (nameOrIp !== undefined) updateFields.nameOrIp = nameOrIp;
@@ -2535,6 +2537,7 @@ app.put("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
     if (available !== undefined) updateFields.available = available;
     if (bestSeller !== undefined) updateFields.bestSeller = bestSeller;
     if (category !== undefined) updateFields.category = category === "linux" ? "linux" : "vps";
+    if (isTrial !== undefined) updateFields.isTrial = !!isTrial;
 
     const plan = await VpsPlan.findByIdAndUpdate(
       req.params.id,
