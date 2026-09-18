@@ -509,6 +509,7 @@ const couponSchema = new mongoose.Schema(
         category: { type: String, enum: ["vps", "linux", "both"], default: "both" },
     allowedRole: { type: String, enum: ["user", "seller", "both"], default: "both" },
     assignedToEmail: { type: String, lowercase: true, trim: true, default: null },
+    assignedToVpsId: { type: String, default: null },
   },
   { timestamps: true }
 );
@@ -744,7 +745,7 @@ async function optionalAuth(req, res, next) {
 // Ek coupon code, plan price aur user ke against valid hai ya nahi check karta hai.
 // Ye function backend ke andar hi use hota hai (create-payment aur validate dono jagah)
 // taaki logic ek hi jagah rahe aur dono kabhi out-of-sync na ho.
-async function checkCouponValidity(code, price, userId, category, userEmail, userRole) {
+async function checkCouponValidity(code, price, userId, category, userEmail, userRole, vpsId) {
   if (!code) {
     return { valid: false, message: "Coupon code do." };
   }
@@ -794,6 +795,11 @@ async function checkCouponValidity(code, price, userId, category, userEmail, use
 
   if (coupon.assignedToEmail) {
     if (!userEmail || coupon.assignedToEmail !== userEmail.toLowerCase().trim()) {
+      return { valid: false, message: "Ye coupon code valid nahi hai." };
+    }
+  }
+    if (coupon.assignedToVpsId) {
+    if (!vpsId || coupon.assignedToVpsId !== vpsId) {
       return { valid: false, message: "Ye coupon code valid nahi hai." };
     }
   }
@@ -1156,7 +1162,7 @@ app.post("/api/coupons/validate", couponLimiter, protect, async (req, res) => {
 
         const currentUser = await User.findById(req.userId).select("email role");
     const effectivePrice = getEffectivePrice(selectedOption, currentUser.role);
-    const result = await checkCouponValidity(code, effectivePrice, req.userId, cat, currentUser?.email, currentUser?.role);
+    const result = await checkCouponValidity(code, effectivePrice, req.userId, cat, currentUser?.email, currentUser?.role, vpsId);
 
     if (!result.valid) {
       logPurchaseActivity({
@@ -1226,7 +1232,7 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
     // (frontend ka discount kabhi trust nahi karna, warna koi bhi manually price ghata sakta hai)
     
     if (couponCode) {
-      const result = await checkCouponValidity(couponCode, effectivePrice, req.userId, cat, user?.email, user?.role);
+      const result = await checkCouponValidity(couponCode, effectivePrice, req.userId, cat, user?.email, user?.role, plan.vpsId);
       if (!result.valid) {
         logPurchaseActivity({ user: req.userId, category: cat, vpsId, nameOrIp: plan.nameOrIp, ram: selectedOption.ram, stage: "create-payment", status: "failed", message: result.message });
         return res.status(400).json({ message: result.message });
@@ -2600,7 +2606,7 @@ app.post("/api/admin/coupons", protect, isAdmin, async (req, res) => {
     const {
       code, discountType, discountValue, maxDiscountAmount,
       minOrderAmount, usageLimit, perUserLimit, expiresAt, active,
-      category, assignedToEmail, allowedRole,
+      category, assignedToEmail, allowedRole, assignedToVpsId,
     } = req.body;
 
     if (!code || !discountType || !discountValue) {
@@ -2625,6 +2631,7 @@ app.post("/api/admin/coupons", protect, isAdmin, async (req, res) => {
       category: (category === "vps" || category === "linux") ? category : "both",
       allowedRole: (allowedRole === "user" || allowedRole === "seller") ? allowedRole : "both",
       assignedToEmail: assignedToEmail ? assignedToEmail.trim().toLowerCase() : null,
+      assignedToVpsId: assignedToVpsId || null,
     });
 
     res.status(201).json({ message: "Coupon add ho gaya!", coupon });
@@ -2638,7 +2645,7 @@ app.put("/api/admin/coupons/:id", protect, isAdmin, async (req, res) => {
     const {
       discountType, discountValue, maxDiscountAmount,
       minOrderAmount, usageLimit, perUserLimit, expiresAt, active,
-      category, assignedToEmail, allowedRole,
+      category, assignedToEmail, allowedRole, assignedToVpsId,
     } = req.body;
 
     const updateFields = {};
@@ -2653,6 +2660,7 @@ app.put("/api/admin/coupons/:id", protect, isAdmin, async (req, res) => {
     if (category !== undefined) updateFields.category = (category === "vps" || category === "linux") ? category : "both";
     if (allowedRole !== undefined) updateFields.allowedRole = (allowedRole === "user" || allowedRole === "seller") ? allowedRole : "both";
     if (assignedToEmail !== undefined) updateFields.assignedToEmail = assignedToEmail ? assignedToEmail.trim().toLowerCase() : null;
+    if (assignedToVpsId !== undefined) updateFields.assignedToVpsId = assignedToVpsId || null;
 
     const coupon = await Coupon.findByIdAndUpdate(req.params.id, updateFields, { new: true });
     if (!coupon) {
