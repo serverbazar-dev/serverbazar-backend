@@ -565,6 +565,7 @@ const dashboardNoticeSchema = new mongoose.Schema(
     message: { type: String, required: true },
     targetEmail: { type: String, lowercase: true, trim: true, default: null },
     active: { type: Boolean, default: true },
+    showOnVpsPage: { type: Boolean, default: false },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   },
   { timestamps: true }
@@ -2802,7 +2803,7 @@ app.get("/api/admin/dashboard-notices", protect, isAdmin, async (req, res) => {
 
 app.post("/api/admin/dashboard-notices", protect, isAdmin, async (req, res) => {
   try {
-    const { title, message, targetEmail } = req.body;
+    const { title, message, targetEmail, showOnVpsPage } = req.body;
     if (!title || !message) {
       return res.status(400).json({ message: "Title aur message dono bharo." });
     }
@@ -2810,6 +2811,7 @@ app.post("/api/admin/dashboard-notices", protect, isAdmin, async (req, res) => {
       title,
       message,
       targetEmail: targetEmail ? targetEmail.trim().toLowerCase() : null,
+      showOnVpsPage: !!showOnVpsPage,
       createdBy: req.userId,
     });
     res.status(201).json({ message: "Announcement bhej diya gaya!", notice });
