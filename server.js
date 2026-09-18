@@ -557,6 +557,19 @@ const noticeSchema = new mongoose.Schema(
 );
 const Notice = mongoose.model("Notice", noticeSchema);
 noticeSchema.index({ active: 1, category: 1, createdAt: -1 });
+// ==================== DASHBOARD NOTICE SCHEMA (Personal / Targeted Announcement) ====================
+const dashboardNoticeSchema = new mongoose.Schema(
+  {
+    title: { type: String, required: true },
+    message: { type: String, required: true },
+    targetEmail: { type: String, lowercase: true, trim: true, default: null },
+    active: { type: Boolean, default: true },
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  },
+  { timestamps: true }
+);
+const DashboardNotice = mongoose.model("DashboardNotice", dashboardNoticeSchema);
+dashboardNoticeSchema.index({ active: 1, targetEmail: 1, createdAt: -1 });
 
 // ==================== WALLET SCHEMAS ====================
 const walletSchema = new mongoose.Schema(
@@ -2743,6 +2756,76 @@ app.put("/api/admin/notices/:id", protect, isAdmin, async (req, res) => {
       return res.status(404).json({ message: "Notice nahi mila." });
     }
     res.json({ message: "Notice update ho gaya.", notice });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+// ==================== DASHBOARD NOTICE ROUTES (USER — MY ORDERS PAGE) ====================
+app.get("/api/dashboard-notices", protect, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId).select("email");
+    if (!user) return res.status(404).json({ message: "User nahi mila." });
+
+    const notices = await DashboardNotice.find({
+      active: true,
+      $or: [{ targetEmail: null }, { targetEmail: user.email.toLowerCase() }],
+    })
+      .sort({ createdAt: -1 })
+      .limit(10)
+      .lean();
+
+    res.json(notices);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ==================== DASHBOARD NOTICE ROUTES (ADMIN) ====================
+app.get("/api/admin/dashboard-notices", protect, isAdmin, async (req, res) => {
+  try {
+    const notices = await DashboardNotice.find()
+      .populate("createdBy", "name email")
+      .sort({ createdAt: -1 });
+    res.json(notices);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+app.post("/api/admin/dashboard-notices", protect, isAdmin, async (req, res) => {
+  try {
+    const { title, message, targetEmail } = req.body;
+    if (!title || !message) {
+      return res.status(400).json({ message: "Title aur message dono bharo." });
+    }
+    const notice = await DashboardNotice.create({
+      title,
+      message,
+      targetEmail: targetEmail ? targetEmail.trim().toLowerCase() : null,
+      createdBy: req.userId,
+    });
+    res.status(201).json({ message: "Announcement bhej diya gaya!", notice });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+app.put("/api/admin/dashboard-notices/:id", protect, isAdmin, async (req, res) => {
+  try {
+    const { active } = req.body;
+    const notice = await DashboardNotice.findByIdAndUpdate(req.params.id, { active }, { new: true });
+    if (!notice) return res.status(404).json({ message: "Notice nahi mila." });
+    res.json({ message: "Notice update ho gaya.", notice });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+app.delete("/api/admin/dashboard-notices/:id", protect, isAdmin, async (req, res) => {
+  try {
+    const notice = await DashboardNotice.findByIdAndDelete(req.params.id);
+    if (!notice) return res.status(404).json({ message: "Notice nahi mila." });
+    res.json({ message: "Notice delete ho gaya." });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
