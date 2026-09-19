@@ -2935,6 +2935,92 @@ app.post("/api/webhooks/razorpay", async (req, res) => {
     res.status(500).json({ message: "Webhook processing error." });
   }
 });
+// ==================== CASHFREE WEBHOOK (SERVER-TO-SERVER CONFIRMATION) ====================
+app.post("/api/webhooks/cashfree", async (req, res) => {
+  try {
+    const signature = req.headers["x-webhook-signature"];
+    const timestamp = req.headers["x-webhook-timestamp"];
+
+    if (!signature || !timestamp || !req.rawBody) {
+      return res.status(400).json({ message: "Webhook signature missing." });
+    }
+
+    try {
+      cashfreeClient.PGVerifyWebhookSignature(signature, req.rawBody.toString(), timestamp);
+    } catch (sigErr) {
+      console.error("Cashfree webhook: signature mismatch, ignore kar rahe hain.", sigErr.message);
+      return res.status(400).json({ message: "Invalid signature." });
+    }
+
+    if (req.body.type !== "PAYMENT_SUCCESS_WEBHOOK") {
+      return res.status(200).json({ message: "Event ignored." });
+    }
+
+    const orderData = req.body.data?.order;
+    const paymentData = req.body.data?.payment;
+    if (!orderData || !paymentData) {
+      return res.status(200).json({ message: "No order/payment data." });
+    }
+
+    const cfOrderId = orderData.order_id;
+    const cfPaymentId = paymentData.cf_payment_id;
+
+    const alreadyExists = await Order.findOne({ cfOrderId });
+    if (alreadyExists) {
+      return res.status(200).json({ message: "Order already exists." });
+    }
+
+    const pending = await PendingPayment.findOneAndDelete({ cfOrderId });
+    if (!pending) {
+      console.warn(`Cashfree webhook: pending record nahi mila order ${cfOrderId} ke liye. Manual check karo.`);
+      return res.status(200).json({ message: "Pending record not found." });
+    }
+
+    if (Number(orderData.order_amount) !== Number(pending.finalAmount)) {
+      console.error(`Cashfree webhook: amount mismatch order ${cfOrderId} ke liye.`);
+      return res.status(200).json({ message: "Amount mismatch." });
+    }
+
+    const order = await Order.create({
+      user: pending.user,
+      planName: pending.planName,
+      category: pending.category,
+      vpsId: pending.vpsId,
+      nameOrIp: pending.nameOrIp,
+      ram: pending.ram,
+      price: pending.price,
+      couponCode: pending.couponCode,
+      discountAmount: pending.discountAmount,
+      finalAmount: pending.finalAmount,
+      status: "pending",
+      cfOrderId,
+      cfPaymentId,
+      paymentGateway: "cashfree",
+      paymentStatus: "paid",
+    });
+
+    if (pending.couponCode) {
+      await Coupon.updateOne({ code: pending.couponCode }, { $inc: { usedCount: 1 } });
+    }
+
+    logPurchaseActivity({
+      user: pending.user, category: pending.category, vpsId: pending.vpsId,
+      nameOrIp: pending.nameOrIp, ram: pending.ram, gateway: "cashfree",
+      stage: "verify-payment", status: "success",
+      message: "Payment confirm ✅ (webhook se)", amount: pending.finalAmount,
+    });
+
+    try {
+      const orderedByUser = await User.findById(order.user).select("name email");
+      sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
+    } catch (e) {}
+
+    res.status(200).json({ message: "Order created via webhook." });
+  } catch (err) {
+    console.error("Cashfree webhook error:", err.message);
+    res.status(500).json({ message: "Webhook processing error." });
+  }
+});
 app.get("/debug-hh-test", async (req, res) => {
   try {
     const result = await fetch(`${HOSTHEAVEN_BASE}/api/login`, {
