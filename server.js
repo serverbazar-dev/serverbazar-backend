@@ -486,6 +486,7 @@ const vpsPlanSchema = new mongoose.Schema(
     ],
     available: { type: Boolean, default: true },
     bestSeller: { type: Boolean, default: false }, // admin manually marks this as "Most Demanded"
+    pinnedPosition: { type: Boolean, default: false }, // true = out-of-stock hone par bhi neeche mat bhejo, jahan set kiya hai wahi dikhao
     category: { type: String, enum: ["vps", "linux"], default: "vps" }, // "vps" ya "linux"
     sortOrder: { type: Number, default: 0 },
     isTrial: { type: Boolean, default: false },
@@ -2527,7 +2528,7 @@ app.put("/api/admin/vps-plans/reorder", protect, isAdmin, async (req, res) => {
 
 app.put("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
   try {
-    const { nameOrIp, label, company, ramOptions, available, bestSeller, category, isTrial } = req.body;
+    const { nameOrIp, label, company, ramOptions, available, bestSeller, category, isTrial, pinnedPosition } = req.body;
 
     const updateFields = {};
     if (nameOrIp !== undefined) updateFields.nameOrIp = nameOrIp;
@@ -2538,6 +2539,7 @@ app.put("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
     if (bestSeller !== undefined) updateFields.bestSeller = bestSeller;
     if (category !== undefined) updateFields.category = category === "linux" ? "linux" : "vps";
     if (isTrial !== undefined) updateFields.isTrial = !!isTrial;
+    if (pinnedPosition !== undefined) updateFields.pinnedPosition = !!pinnedPosition;
 
     const plan = await VpsPlan.findByIdAndUpdate(
       req.params.id,
