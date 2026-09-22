@@ -2349,6 +2349,15 @@ app.put("/api/ol/admin/link/:orderId", protect, isAdmin, async (req, res) => {
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
+// ---- TEMPORARY DEBUG: raw OceanLinux response dekhne ke liye ----
+app.get("/api/ol/admin/debug-raw", protect, isAdmin, async (req, res) => {
+  try {
+    const data = await olApi("/servers");
+    res.json(data);
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
 // ==================== END OCEANLINUX ROUTES ====================
 // ---- Admin: saare OceanLinux servers ki list (VM search dropdown ke liye) ----
 app.get("/api/ol/admin/live-vms", protect, isAdmin, async (req, res) => {
