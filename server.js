@@ -571,6 +571,7 @@ const vpsPlanSchema = new mongoose.Schema(
         price: { type: Number, required: true },
         sellerPrice: { type: Number, default: null }, // seller ke liye special (kam) rate — optional
         available: { type: Boolean, default: true },
+        stockQty: { type: Number, default: null },
       },
     ],
     available: { type: Boolean, default: true },
@@ -813,6 +814,23 @@ function getEffectivePrice(ramOption, userRole) {
     return Number(ramOption.sellerPrice);
   }
   return Number(ramOption.price);
+}
+
+async function decrementRamStock(vpsId, category, ram) {
+  try {
+    const plan = await VpsPlan.findOne({ vpsId, category });
+    if (!plan) return;
+    const option = plan.ramOptions.find((o) => o.ram === ram);
+    if (!option || option.stockQty == null) return;
+
+    option.stockQty = Math.max(0, option.stockQty - 1);
+    if (option.stockQty === 0) {
+      option.available = false;
+    }
+    await plan.save();
+  } catch (err) {
+    console.error("decrementRamStock error:", err.message);
+  }
 }
 
 // Token ho to decode karke role attach karta hai, na ho ya invalid ho to bhi
@@ -1381,6 +1399,8 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
         await session.commitTransaction();
         session.endSession();
 
+        await decrementRamStock(plan.vpsId, cat, selectedOption.ram);
+
         try {
           const orderedByUser = await User.findById(order.user).select("name email");
           sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
@@ -1546,6 +1566,8 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
       paymentStatus: "paid",
     });
 
+    await decrementRamStock(order.vpsId, order.category, order.ram);
+
     // Coupon ka usedCount badhao (agar coupon use hua tha)
     if (pending.couponCode) {
       await Coupon.updateOne({ code: pending.couponCode }, { $inc: { usedCount: 1 } });
@@ -1621,6 +1643,8 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
       paymentGateway: "cashfree",
       paymentStatus: "paid",
     });
+
+    await decrementRamStock(order.vpsId, order.category, order.ram);
 
     if (pending.couponCode) {
       await Coupon.updateOne({ code: pending.couponCode }, { $inc: { usedCount: 1 } });
@@ -2826,7 +2850,7 @@ app.delete("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
 // ---------- ADMIN: EK SPECIFIC RAM OPTION KA STOCK TOGGLE KARO ----------
 app.put("/api/admin/vps-plans/:id/ram-stock", protect, isAdmin, async (req, res) => {
   try {
-    const { ram, available } = req.body;
+    const { ram, available, stockQty } = req.body;
     if (!ram || typeof available !== "boolean") {
       return res.status(400).json({ message: "ram aur available (true/false) dono zaroori hai." });
     }
@@ -2842,8 +2866,17 @@ app.put("/api/admin/vps-plans/:id/ram-stock", protect, isAdmin, async (req, res)
     }
 
     option.available = available;
-    await plan.save();
 
+    if (available) {
+      if (stockQty !== undefined && stockQty !== null && stockQty !== "") {
+        const num = Number(stockQty);
+        option.stockQty = num > 0 ? num : null;
+      }
+    } else {
+      option.stockQty = 0;
+    }
+
+    await plan.save();
     res.json({ message: "RAM stock update ho gaya.", plan });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
@@ -3166,6 +3199,8 @@ app.post("/api/webhooks/razorpay", async (req, res) => {
       paymentStatus: "paid",
     });
 
+    await decrementRamStock(order.vpsId, order.category, order.ram);
+
     if (pending.couponCode) {
       await Coupon.updateOne({ code: pending.couponCode }, { $inc: { usedCount: 1 } });
     }
@@ -3251,6 +3286,8 @@ app.post("/api/webhooks/cashfree", async (req, res) => {
       paymentGateway: "cashfree",
       paymentStatus: "paid",
     });
+
+    await decrementRamStock(order.vpsId, order.category, order.ram);
 
     if (pending.couponCode) {
       await Coupon.updateOne({ code: pending.couponCode }, { $inc: { usedCount: 1 } });
