@@ -575,6 +575,7 @@ const vpsPlanSchema = new mongoose.Schema(
       },
     ],
     available: { type: Boolean, default: true },
+    stockQty: { type: Number, default: null }, // ✅ NAYA — pura plan ka shared stock pool (null = unlimited)
     bestSeller: { type: Boolean, default: false }, // admin manually marks this as "Most Demanded"
     pinnedPosition: { type: Boolean, default: false }, // true = out-of-stock hone par bhi neeche mat bhejo, jahan set kiya hai wahi dikhao
     category: { type: String, enum: ["vps", "linux"], default: "vps" }, // "vps" ya "linux"
@@ -819,13 +820,12 @@ function getEffectivePrice(ramOption, userRole) {
 async function decrementRamStock(vpsId, category, ram) {
   try {
     const plan = await VpsPlan.findOne({ vpsId, category });
-    if (!plan) return;
-    const option = plan.ramOptions.find((o) => o.ram === ram);
-    if (!option || option.stockQty == null) return;
+    if (!plan || plan.stockQty == null) return; // unlimited — skip
 
-    option.stockQty = Math.max(0, option.stockQty - 1);
-    if (option.stockQty === 0) {
-      option.available = false;
+    plan.stockQty = Math.max(0, plan.stockQty - 1);
+    if (plan.stockQty === 0) {
+      plan.available = false;
+      plan.ramOptions.forEach((o) => { o.available = false; });
     }
     await plan.save();
   } catch (err) {
@@ -2805,28 +2805,39 @@ app.put("/api/admin/vps-plans/reorder", protect, isAdmin, async (req, res) => {
 
 app.put("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
   try {
-    const { nameOrIp, label, company, ramOptions, available, bestSeller, category, isTrial, pinnedPosition } = req.body;
+    const { nameOrIp, label, company, ramOptions, available, bestSeller, category, isTrial, pinnedPosition, stockQty } = req.body;
 
-    const updateFields = {};
-    if (nameOrIp !== undefined) updateFields.nameOrIp = nameOrIp;
-    if (label !== undefined) updateFields.label = label;
-    if (company !== undefined) updateFields.company = company;
-    if (ramOptions !== undefined) updateFields.ramOptions = ramOptions;
-    if (available !== undefined) updateFields.available = available;
-    if (bestSeller !== undefined) updateFields.bestSeller = bestSeller;
-    if (category !== undefined) updateFields.category = category === "linux" ? "linux" : "vps";
-    if (isTrial !== undefined) updateFields.isTrial = !!isTrial;
-    if (pinnedPosition !== undefined) updateFields.pinnedPosition = !!pinnedPosition;
-
-    const plan = await VpsPlan.findByIdAndUpdate(
-      req.params.id,
-      updateFields,
-      { new: true, runValidators: true }
-    );
-
+    const plan = await VpsPlan.findById(req.params.id);
     if (!plan) {
       return res.status(404).json({ message: "Plan nahi mila." });
     }
+
+    if (nameOrIp !== undefined) plan.nameOrIp = nameOrIp;
+    if (label !== undefined) plan.label = label;
+    if (company !== undefined) plan.company = company;
+    if (ramOptions !== undefined) plan.ramOptions = ramOptions;
+    if (bestSeller !== undefined) plan.bestSeller = bestSeller;
+    if (category !== undefined) plan.category = category === "linux" ? "linux" : "vps";
+    if (isTrial !== undefined) plan.isTrial = !!isTrial;
+    if (pinnedPosition !== undefined) plan.pinnedPosition = !!pinnedPosition;
+
+    if (available !== undefined) {
+      plan.available = available;
+
+      if (available === true) {
+        // ✅ NAYA — ek hi shared stock pool poore plan ke liye, chahe koi bhi RAM bike
+        if (stockQty !== undefined && stockQty !== null) {
+          const num = Number(stockQty);
+          plan.stockQty = num > 0 ? num : null;
+        }
+        plan.ramOptions.forEach((o) => { o.available = true; });
+      } else {
+        plan.stockQty = 0;
+        plan.ramOptions.forEach((o) => { o.available = false; });
+      }
+    }
+
+    await plan.save();
 
     res.json({ message: "Plan update ho gaya.", plan });
   } catch (err) {
@@ -2850,7 +2861,7 @@ app.delete("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
 // ---------- ADMIN: EK SPECIFIC RAM OPTION KA STOCK TOGGLE KARO ----------
 app.put("/api/admin/vps-plans/:id/ram-stock", protect, isAdmin, async (req, res) => {
   try {
-    const { ram, available, stockQty } = req.body;
+    const { ram, available } = req.body;
     if (!ram || typeof available !== "boolean") {
       return res.status(400).json({ message: "ram aur available (true/false) dono zaroori hai." });
     }
@@ -2866,17 +2877,8 @@ app.put("/api/admin/vps-plans/:id/ram-stock", protect, isAdmin, async (req, res)
     }
 
     option.available = available;
-
-    if (available) {
-      if (stockQty !== undefined && stockQty !== null && stockQty !== "") {
-        const num = Number(stockQty);
-        option.stockQty = num > 0 ? num : null;
-      }
-    } else {
-      option.stockQty = 0;
-    }
-
     await plan.save();
+
     res.json({ message: "RAM stock update ho gaya.", plan });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
