@@ -501,6 +501,20 @@ function buildOrderAlertMessage({ user, order, isManual = false }) {
 
   return lines.join("\n");
 }
+// Wallet recharge hone par admin ko alert message banata hai
+function buildWalletRechargeAlertMessage({ user, amount, newBalance, paymentId }) {
+  const lines = [
+    `💰 <b>Wallet Recharge Hua!</b>`,
+    ``,
+    `👤 <b>Naam:</b> ${escapeHtml(user?.name)}`,
+    `📧 <b>Email:</b> ${escapeHtml(user?.email)}`,
+    `➕ <b>Amount Added:</b> ₹${amount}`,
+    `💳 <b>Gateway:</b> Razorpay`,
+    `🧾 <b>Payment ID:</b> <code>${escapeHtml(paymentId || "-")}</code>`,
+    `💰 <b>Naya Wallet Balance:</b> ₹${newBalance}`,
+  ];
+  return lines.join("\n");
+}
 
 // ==================== SCHEMAS ====================
 const userSchema = new mongoose.Schema(
@@ -2509,6 +2523,20 @@ app.post("/api/wallet/verify-recharge", protect, async (req, res) => {
       { $inc: { balance: Number(amount) } },
       { new: true, upsert: true }
     );
+        // ---- Telegram alert: admin ko turant wallet recharge notify karo ----
+    try {
+      const rechargedByUser = await User.findById(req.userId).select("name email");
+      sendTelegramMessage(
+        buildWalletRechargeAlertMessage({
+          user: rechargedByUser,
+          amount: Number(amount),
+          newBalance: wallet.balance,
+          paymentId: razorpay_payment_id,
+        })
+      );
+    } catch (alertErr) {
+      console.error("Wallet recharge Telegram alert error:", alertErr.message);
+    }
 
     res.json({ message: "Wallet recharge ho gaya!", balance: wallet.balance });
   } catch (err) {
