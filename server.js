@@ -2391,7 +2391,7 @@ app.get("/api/ol/my-servers", protect, async (req, res) => {
 app.post("/api/ol/control", protect, async (req, res) => {
   try {
     const { olOrderId, action } = req.body;
-    if (!["start", "stop", "restart"].includes(action)) {
+    if (!["start", "stop", "restart", "status"].includes(action)) {
       return res.status(400).json({ success: false, message: "Invalid action." });
     }
     const order = await olFindOwned(req.userId, olOrderId);
