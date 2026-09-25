@@ -233,46 +233,6 @@ async function mxOverview() {
   mxOverviewTime = now;
   return data;
 }
-// ==================== OCEANLINUX RESELLER CLIENT (NAYA) ====================
-const OL_BASE = process.env.OCEANLINUX_RESELLER_BASE || "https://oceanlinux.com/api/v1/reseller";
-const OL_API_KEY = process.env.OCEANLINUX_API_KEY;
-const OL_API_SECRET = process.env.OCEANLINUX_API_SECRET;
-
-function olHeaders() {
-  return {
-    "Content-Type": "application/json",
-    "x-api-key": OL_API_KEY,
-    "x-api-secret": OL_API_SECRET,
-  };
-}
-
-let olChain = Promise.resolve();
-function olApi(endpoint, method = "GET", body = null) {
-  const run = olChain.then(async () => {
-    const res = await fetch(`${OL_BASE}${endpoint}`, {
-      method,
-      headers: olHeaders(),
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    const raw = await res.text();
-    let data;
-    try { data = JSON.parse(raw); }
-    catch (e) { throw new Error(`OceanLinux JSON nahi aaya (HTTP ${res.status}): ${raw.slice(0, 200)}`); }
-    if (!res.ok || data.success === false) {
-      const err = new Error(data.message || data.error || `OceanLinux error (HTTP ${res.status})`);
-      err.status = res.status;
-      throw err;
-    }
-    return data;
-  });
-  olChain = run.catch(() => {}).then(() => new Promise((r) => setTimeout(r, 300)));
-  return run;
-}
-
-async function olFindOwned(userId, olOrderId) {
-  return Order.findOne({ user: userId, olOrderId: String(olOrderId) });
-}
-// ==================== END OCEANLINUX RESELLER CLIENT ====================
 // ==================== END METRICSX CLIENT ====================
 
 const app = express();
@@ -608,7 +568,6 @@ formatSolution: { type: String },
 formatSeenByUser: { type: Boolean, default: true },
 vmId: { type: Number, default: null },
 mxVmId: { type: Number, default: null },
-olOrderId: { type: String, default: null },
   },
   { timestamps: true }
 );
@@ -2309,136 +2268,6 @@ app.post("/api/mx/admin/link-latest", protect, isAdmin, async (req, res) => {
   }
 });
 // ==================== END METRICSX ROUTES ====================
-// ==================== OCEANLINUX RESELLER ROUTES (NAYA) ====================
-
-// ---- Admin: kisi order ko OceanLinux order se link karo ----
-app.put("/api/ol/admin/link/:orderId", protect, isAdmin, async (req, res) => {
-  try {
-    const { olOrderId } = req.body;
-    if (!olOrderId) return res.status(400).json({ message: "olOrderId zaroori hai." });
-    const order = await Order.findByIdAndUpdate(req.params.orderId, { olOrderId: String(olOrderId) }, { new: true });
-    if (!order) return res.status(404).json({ message: "Order nahi mila." });
-    res.json({ message: "OceanLinux order link ho gaya.", order });
-  } catch (err) {
-    res.status(500).json({ message: "Server error", error: err.message });
-  }
-});
-
-// ---- Admin: user ka sabse naya order OceanLinux order se link karo (Manual Order ke liye) ----
-app.post("/api/ol/admin/link-latest", protect, isAdmin, async (req, res) => {
-  try {
-    const olOrderId = String(req.body.olOrderId || "");
-    const email = String(req.body.email || "").toLowerCase().trim();
-    if (!olOrderId || !email) return res.status(400).json({ message: "email aur olOrderId zaroori hai." });
-    const user = await User.findOne({ email });
-    if (!user) return res.status(404).json({ message: "User nahi mila." });
-    const order = await Order.findOne({ user: user._id }).sort({ createdAt: -1 });
-    if (!order) return res.status(404).json({ message: "Order nahi mila." });
-    order.olOrderId = olOrderId;
-    await order.save();
-    res.json({ message: "OceanLinux order link ho gaya.", order });
-  } catch (err) {
-    res.status(500).json({ message: "Server error", error: err.message });
-  }
-});
-
-// ---- Admin: saare OceanLinux orders (VM search dropdown ke liye) ----
-app.get("/api/ol/admin/live-vms", protect, isAdmin, async (req, res) => {
-  try {
-    const data = await olApi("/orders?limit=100");
-    const vms = (data.orders || []).map((o) => ({
-      vmId: o.id,
-      ip: o.ipAddress || "",
-      os: o.os || "",
-      plan: o.productName || "",
-      status: o.provisioningStatus || o.status || "",
-    }));
-    res.json({ success: true, vms });
-  } catch (err) {
-    res.json({ success: false, message: err.message });
-  }
-});
-
-// ---- User: apne saare OceanLinux servers (live status ke saath) ----
-app.get("/api/ol/my-servers", protect, async (req, res) => {
-  try {
-    const orders = await Order.find({ user: req.userId, olOrderId: { $ne: null } });
-    if (!orders.length) return res.json({ success: true, servers: [] });
-
-    const servers = await Promise.all(orders.map(async (o) => {
-      let powerState = "unknown";
-      try {
-        const statusData = await olApi("/orders/manage", "POST", { orderId: o.olOrderId, action: "status" });
-        powerState = statusData?.data?.powerState || "unknown";
-      } catch (e) {}
-      return {
-        orderId: o._id,
-        olOrderId: o.olOrderId,
-        planName: o.nameOrIp || o.planName,
-        ip: o.deliveryIp,
-        os: o.deliveryOS,
-        powerState,
-      };
-    }));
-
-    res.json({ success: true, servers });
-  } catch (err) {
-    res.json({ success: false, servers: [], message: err.message });
-  }
-});
-
-// ---- User: start / stop / restart ----
-app.post("/api/ol/control", protect, async (req, res) => {
-  try {
-    const { olOrderId, action } = req.body;
-    if (!["start", "stop", "restart", "status"].includes(action)) {
-      return res.status(400).json({ success: false, message: "Invalid action." });
-    }
-    const order = await olFindOwned(req.userId, olOrderId);
-    if (!order) return res.status(403).json({ success: false, message: "Ye server aapka nahi hai." });
-
-    const data = await olApi("/orders/manage", "POST", { orderId: olOrderId, action });
-    res.json({ success: true, data });
-  } catch (err) {
-    res.json({ success: false, message: err.message });
-  }
-});
-
-// ---- User: OS templates list (format/reinstall ke liye) ----
-app.get("/api/ol/templates/:olOrderId", protect, async (req, res) => {
-  try {
-    const order = await olFindOwned(req.userId, req.params.olOrderId);
-    if (!order) return res.status(403).json({ success: false, message: "Ye server aapka nahi hai." });
-    const data = await olApi("/orders/manage", "POST", { orderId: req.params.olOrderId, action: "templates" });
-    res.json({ success: true, templates: data.data || data.osTemplates || [] });
-  } catch (err) {
-    res.json({ success: false, templates: [], message: err.message });
-  }
-});
-
-// ---- User: format / reinstall (naya OS daal ke server reset) ----
-const olFormatInProgress = new Set();
-app.post("/api/ol/format", protect, async (req, res) => {
-  const { olOrderId, osType } = req.body;
-  const lockKey = String(olOrderId);
-  try {
-    if (!osType) return res.status(400).json({ success: false, message: "osType zaroori hai." });
-    const order = await olFindOwned(req.userId, olOrderId);
-    if (!order) return res.status(403).json({ success: false, message: "Ye server aapka nahi hai." });
-    if (olFormatInProgress.has(lockKey)) {
-      return res.json({ success: false, message: "Format already chal raha hai, thodi der wait karo." });
-    }
-    olFormatInProgress.add(lockKey);
-
-    const data = await olApi("/orders/manage", "POST", { orderId: olOrderId, action: "reinstall", osType });
-    setTimeout(() => olFormatInProgress.delete(lockKey), 3 * 60 * 1000);
-    res.json({ success: true, data });
-  } catch (err) {
-    olFormatInProgress.delete(lockKey);
-    res.json({ success: false, message: err.message });
-  }
-});
-// ==================== END OCEANLINUX RESELLER ROUTES ====================
 // ==================== WALLET ROUTES ====================
 
 // ---------- BALANCE DEKHO ----------
