@@ -749,7 +749,7 @@ const purchaseActivitySchema = new mongoose.Schema({
   gateway: { type: String },
   stage: {
     type: String,
-    enum: ["selected", "coupon", "create-payment", "verify-payment"],
+    enum: ["selected", "coupon", "create-payment", "verify-payment", "wallet-recharge"],
     required: true,
   },
   status: { type: String, enum: ["success", "failed"], required: true },
@@ -2517,13 +2517,25 @@ app.post("/api/wallet/verify-recharge", protect, async (req, res) => {
       throw dupErr;
     }
 
-    // Transaction record safal bana, ab hi balance add karo
+        // Transaction record safal bana, ab hi balance add karo
     const wallet = await Wallet.findOneAndUpdate(
       { user: req.userId },
       { $inc: { balance: Number(amount) } },
       { new: true, upsert: true }
     );
-        // ---- Telegram alert: admin ko turant wallet recharge notify karo ----
+
+    // ---- Admin dashboard "Live Purchase Activity" me dikhane ke liye log karo ----
+    logPurchaseActivity({
+      user: req.userId,
+      nameOrIp: "💰 Wallet Recharge",
+      gateway: "razorpay",
+      stage: "wallet-recharge",
+      status: "success",
+      message: "Wallet recharge confirm ✅",
+      amount: Number(amount),
+    });
+
+    // ---- Telegram alert: admin ko turant wallet recharge notify karo ----
     try {
       const rechargedByUser = await User.findById(req.userId).select("name email");
       sendTelegramMessage(
