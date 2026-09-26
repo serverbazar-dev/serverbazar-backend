@@ -236,6 +236,7 @@ async function mxOverview() {
 // ==================== END METRICSX CLIENT ====================
 
 const app = express();
+app.set('trust proxy', 1);
 
 const allowedOrigins = [
   "https://serverbazar.com",
