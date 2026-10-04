@@ -361,6 +361,40 @@ function decryptSecret(payload) {
   decipher.setAuthTag(authTag);
   return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
 }
+// ==================== PANEL (MANUAL) VPS HELPERS ====================
+const PANEL_LINKS = {
+  oceanvps: "https://www.oceanvps.in/",
+  hosthell: "https://hosthell.com/access-server",
+};
+
+function buildPanelFields(body, keepOldPassword = false) {
+  const provider = body.panelProvider;
+  if (!PANEL_LINKS[provider]) {
+    return { panelProvider: "none", panelUsername: "", panelPasswordEnc: "" };
+  }
+  const fields = {
+    panelProvider: provider,
+    panelUsername: String(body.panelUsername || "").trim(),
+  };
+  const pw = String(body.panelPassword || "").trim();
+  if (pw) fields.panelPasswordEnc = encryptSecret(pw);
+  else if (!keepOldPassword) fields.panelPasswordEnc = "";
+  return fields;
+}
+
+function serializeOrderForUser(order) {
+  const o = order.toObject ? order.toObject() : order;
+  if (o.panelProvider && o.panelProvider !== "none") {
+    o.panelUrl = PANEL_LINKS[o.panelProvider];
+    try {
+      o.panelPassword = o.panelPasswordEnc ? decryptSecret(o.panelPasswordEnc) : "";
+    } catch (e) {
+      o.panelPassword = "";
+    }
+  }
+  delete o.panelPasswordEnc;
+  return o;
+}
 
 // ==================== USER-SERVER PROXY SETUP (Squid) ====================
 
@@ -569,6 +603,9 @@ formatSolution: { type: String },
 formatSeenByUser: { type: Boolean, default: true },
 vmId: { type: Number, default: null },
 mxVmId: { type: Number, default: null },
+panelProvider: { type: String, enum: ["none", "oceanvps", "hosthell"], default: "none" },
+panelUsername: { type: String, default: "" },
+panelPasswordEnc: { type: String, default: "" },
   },
   { timestamps: true }
 );
@@ -1689,7 +1726,7 @@ app.get("/api/vps/my-orders", protect, async (req, res) => {
       filter.category = req.query.category;
     }
     const orders = await Order.find(filter).sort({ createdAt: -1 });
-    res.json(orders);
+    res.json(orders.map(serializeOrderForUser));
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
@@ -1745,6 +1782,7 @@ app.post("/api/admin/orders/manual-create", protect, isAdmin, async (req, res) =
           deliveryIp, deliveryPort, deliveryUsername, deliveryPassword, deliveryOS,
           deliveredAt, validityDays: days, expiresAt,
           vmId: vmId ? Number(vmId) : null,
+          ...buildPanelFields(req.body),
         }], { session });
 
         await WalletTransaction.create([{
@@ -1774,6 +1812,7 @@ app.post("/api/admin/orders/manual-create", protect, isAdmin, async (req, res) =
       deliveryIp, deliveryPort, deliveryUsername, deliveryPassword, deliveryOS,
       deliveredAt, validityDays: days, expiresAt,
       vmId: vmId ? Number(vmId) : null,
+      ...buildPanelFields(req.body),
     });
 
     try { sendTelegramMessage(buildOrderAlertMessage({ user: targetUser, order, isManual: true })); } catch (e) {}
@@ -2595,8 +2634,9 @@ app.put("/api/admin/users/:id/role", protect, isAdmin, async (req, res) => {
 app.get("/api/admin/orders", protect, isAdmin, async (req, res) => {
   try {
     const orders = await Order.find()
-      .populate("user", "name email phone")
-      .sort({ createdAt: -1 });
+  .select("-panelPasswordEnc")
+  .populate("user", "name email phone")
+  .sort({ createdAt: -1 });
     res.json(orders);
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
@@ -2663,8 +2703,9 @@ app.get("/api/admin/reports/revenue/day", protect, isAdmin, async (req, res) => 
     if (category === "vps" || category === "linux") filter.category = category;
 
     const orders = await Order.find(filter)
-      .populate("user", "name email phone")
-      .sort({ createdAt: -1 });
+  .select("-panelPasswordEnc")
+  .populate("user", "name email phone")
+  .sort({ createdAt: -1 });
 
     res.json({ orders });
   } catch (err) {
@@ -2683,6 +2724,9 @@ app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
 
     const updateFields = {};
     if (req.body.vmId !== undefined) updateFields.vmId = Number(req.body.vmId) || null;
+    if (req.body.panelProvider !== undefined) {
+  Object.assign(updateFields, buildPanelFields(req.body, true));
+}
     if (status !== undefined) updateFields.status = status;
     if (deliveryIp !== undefined) updateFields.deliveryIp = deliveryIp;
         if (deliveryPort !== undefined) updateFields.deliveryPort = deliveryPort;
@@ -2726,8 +2770,9 @@ app.delete("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
 app.get("/api/admin/format-requests", protect, isAdmin, async (req, res) => {
   try {
     const requests = await Order.find({ formatStatus: "pending" })
-      .populate("user", "name email phone")
-      .sort({ formatRequestedAt: -1 });
+  .select("-panelPasswordEnc")
+  .populate("user", "name email phone")
+  .sort({ formatRequestedAt: -1 });
     res.json(requests);
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
