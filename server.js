@@ -1926,6 +1926,28 @@ app.get("/api/admin/users/search", protect, isAdmin, async (req, res) => {
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
+// ---------- ADMIN: SAME IP PEHLE KISI AUR KO DIYA HUA HAI KYA? ----------
+app.get("/api/admin/orders/check-ip", protect, isAdmin, async (req, res) => {
+  try {
+    const ip = String(req.query.ip || "").trim();
+    if (!ip) return res.json({ duplicates: [] });
+
+    const filter = { deliveryIp: ip, status: { $in: ["delivered", "active"] } };
+    const ex = req.query.excludeOrderId;
+    if (ex && mongoose.Types.ObjectId.isValid(ex)) {
+      filter._id = { $ne: ex };
+    }
+
+    const duplicates = await Order.find(filter)
+      .select("nameOrIp deliveryIp deliveredAt expiresAt user")
+      .populate("user", "name email")
+      .limit(5);
+
+    res.json({ duplicates });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
 // ---------- FORMAT REQUEST BHEJO (LOGIN REQUIRED) ----------
 // User apne active/delivered VPS ke liye format/reinstall request bhejta hai
 app.post("/api/vps/request-format", protect, async (req, res) => {
