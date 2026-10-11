@@ -234,6 +234,93 @@ async function mxOverview() {
   return data;
 }
 // ==================== END METRICSX CLIENT ====================
+// ==================== PRIMEVM CLIENT ====================
+const PV = {
+  base: process.env.PRIMEVM_BASE,
+  email: process.env.PRIMEVM_EMAIL,
+  password: process.env.PRIMEVM_PASSWORD,
+  resellerDomain: process.env.PRIMEVM_RESELLER_DOMAIN,
+};
+let pvToken = null;
+let pvUserId = null;
+let pvLoginPromise = null;
+let pvChain = Promise.resolve();
+let pvOverviewCache = null;
+let pvOverviewTime = 0;
+
+function pvHeaders() {
+  const h = { "Content-Type": "application/json", "User-Agent": MX_UA };
+  if (PV.resellerDomain) h["X-Reseller-Domain"] = PV.resellerDomain;
+  return h;
+}
+
+async function pvLogin() {
+  if (pvToken) return pvToken;
+  if (pvLoginPromise) return pvLoginPromise;
+  pvLoginPromise = (async () => {
+    try {
+      if (!PV.base || !PV.email || !PV.password) throw new Error("PrimeVM env vars set nahi hain.");
+      const res = await fetch(`${PV.base}/api/login`, {
+        method: "POST",
+        headers: pvHeaders(),
+        body: JSON.stringify({ email: PV.email, password: PV.password }),
+      });
+      const raw = await res.text();
+      let data;
+      try { data = JSON.parse(raw); }
+      catch (e) { throw new Error(`PrimeVM login: JSON nahi aaya (HTTP ${res.status}): ${raw.slice(0, 200)}`); }
+      if (!data.token) {
+        throw new Error(`PrimeVM login fail (HTTP ${res.status}): ${data.message || data.error || JSON.stringify(data)}`);
+      }
+      pvToken = data.token;
+      try {
+        const payload = JSON.parse(Buffer.from(pvToken.split(".")[1], "base64").toString());
+        pvUserId = payload.userId || payload.id || payload.sub;
+      } catch (e) {}
+      setTimeout(() => { pvToken = null; }, 50 * 60 * 1000);
+      return pvToken;
+    } finally {
+      pvLoginPromise = null;
+    }
+  })();
+  return pvLoginPromise;
+}
+
+async function pvDirect(endpoint, method, body) {
+  await pvLogin();
+  const doFetch = () =>
+    fetch(`${PV.base}${endpoint}`, {
+      method,
+      headers: { ...pvHeaders(), Authorization: `Bearer ${pvToken}` },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  let res = await doFetch();
+  if (res.status === 401 || res.status === 403) {
+    pvToken = null;
+    await pvLogin();
+    res = await doFetch();
+  }
+  const raw = await res.text();
+  try { return JSON.parse(raw); }
+  catch (e) { throw new Error(`PrimeVM JSON nahi aaya (HTTP ${res.status}): ${raw.slice(0, 200)}`); }
+}
+
+// Requests ek-ek karke chalti hain, beech me 500ms gap
+function pvApi(endpoint, method = "GET", body = null) {
+  const run = pvChain.then(() => pvDirect(endpoint, method, body));
+  pvChain = run.catch(() => {}).then(() => new Promise((r) => setTimeout(r, 500)));
+  return run;
+}
+
+async function pvOverview() {
+  const now = Date.now();
+  if (pvOverviewCache && now - pvOverviewTime < 20000) return pvOverviewCache;
+  const data = await pvApi("/api/users/orders/overview?page=0&size=10000");
+  pvOverviewCache = data;
+  pvOverviewTime = now;
+  return data;
+}
+// ==================== END PRIMEVM CLIENT ====================
 
 const app = express();
 app.set('trust proxy', 1);
@@ -603,6 +690,7 @@ formatSolution: { type: String },
 formatSeenByUser: { type: Boolean, default: true },
 vmId: { type: Number, default: null },
 mxVmId: { type: Number, default: null },
+pvVmId: { type: Number, default: null },
 panelProvider: { type: String, enum: ["none", "oceanvps", "hosthell"], default: "none" },
 panelUsername: { type: String, default: "" },
 panelPasswordEnc: { type: String, default: "" },
@@ -1782,6 +1870,7 @@ app.post("/api/admin/orders/manual-create", protect, isAdmin, async (req, res) =
           deliveryIp, deliveryPort, deliveryUsername, deliveryPassword, deliveryOS,
           deliveredAt, validityDays: days, expiresAt,
           vmId: vmId ? Number(vmId) : null,
+          pvVmId: req.body.pvVmId ? Number(req.body.pvVmId) : null,
           ...buildPanelFields(req.body),
         }], { session });
 
@@ -1812,6 +1901,7 @@ app.post("/api/admin/orders/manual-create", protect, isAdmin, async (req, res) =
       deliveryIp, deliveryPort, deliveryUsername, deliveryPassword, deliveryOS,
       deliveredAt, validityDays: days, expiresAt,
       vmId: vmId ? Number(vmId) : null,
+      pvVmId: req.body.pvVmId ? Number(req.body.pvVmId) : null,
       ...buildPanelFields(req.body),
     });
 
@@ -2042,7 +2132,10 @@ app.get("/api/vps/my-hostheaven-vps", protect, async (req, res) => {
 app.post("/api/vps/hostheaven-control", protect, async (req, res) => {
   try {
     const { vmId, action } = req.body;
-    const order = await findOwnedOrderByVmId(req.userId, vmId);
+    if (!["start", "stop", "reboot"].includes(action)) {
+  return res.status(400).json({ success: false, message: "Invalid action." });
+}
+       const order = await findOwnedOrderByVmId(req.userId, vmId);
     if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
     const data = await hostHeavenAPI(`/api/users/${hostHeavenUserId}/vms/${vmId}/control?action=${action}`, "POST", {});
     res.json({ success: true, data });
@@ -2054,6 +2147,9 @@ app.post("/api/vps/hostheaven-control", protect, async (req, res) => {
 app.post("/api/vps/hostheaven-change-password", protect, async (req, res) => {
   try {
     const { vmId, newPassword } = req.body;
+    if (typeof newPassword !== "string" || newPassword.length < 8) {
+  return res.json({ success: false, message: "Password kam se kam 8 characters ka ho." });
+}
     const order = await findOwnedOrderByVmId(req.userId, vmId);
     if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
     const tok = await getHostHeavenToken();
@@ -2124,6 +2220,8 @@ app.post("/api/vps/hostheaven-rebuild", protect, async (req, res) => {
 
 app.get("/api/vps/hostheaven-lock-status/:vmId", protect, async (req, res) => {
   try {
+    const owned = await findOwnedOrderByVmId(req.userId, req.params.vmId);
+if (!owned) return res.json({ success: false, isLocked: false });
     const data = await hostHeavenAPI(`/api/vms/${req.params.vmId}/lock-status`);
     const isLocked = data.isLocked || ["SUSPENDED", "LOCKED", "ERROR"].includes(data.status);
     res.json({ success: true, isLocked, status: data.status || "" });
@@ -2308,6 +2406,152 @@ app.post("/api/mx/admin/link-latest", protect, isAdmin, async (req, res) => {
   }
 });
 // ==================== END METRICSX ROUTES ====================
+// ==================== PRIMEVM ROUTES ====================
+async function pvFindOwned(userId, vmId) {
+  return Order.findOne({ user: userId, pvVmId: Number(vmId) });
+}
+
+// ---- User: apne PrimeVM VMs ki live state ----
+app.get("/api/pv/my-vps", protect, async (req, res) => {
+  try {
+    const orders = await Order.find({ user: req.userId, pvVmId: { $ne: null } });
+    if (!orders.length) return res.json({ success: true, vms: [] });
+    const all = await pvOverview();
+    const ids = orders.map((o) => Number(o.pvVmId));
+    const vms = (all.orders || [])
+      .filter((v) => ids.includes(Number(v.vmId)))
+      .map((v) => ({ vmId: v.vmId, liveState: v.liveState || "" }));
+    res.json({ success: true, vms });
+  } catch (err) {
+    res.json({ success: false, vms: [], message: err.message });
+  }
+});
+
+// ---- User: start / stop / reboot ----
+app.post("/api/pv/control", protect, async (req, res) => {
+  try {
+    const { vmId, action } = req.body;
+    if (!["start", "stop", "reboot"].includes(action)) {
+      return res.status(400).json({ success: false, message: "Invalid action." });
+    }
+    const order = await pvFindOwned(req.userId, vmId);
+    if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
+    await pvLogin();
+    const data = await pvApi(`/api/users/${pvUserId}/vms/${Number(vmId)}/control?action=${action}`, "POST", {});
+    res.json({ success: true, data });
+  } catch (err) {
+    res.json({ success: false, message: err.message });
+  }
+});
+
+// ---- User: password change ----
+app.post("/api/pv/change-password", protect, async (req, res) => {
+  try {
+    const { vmId, newPassword } = req.body;
+    if (typeof newPassword !== "string" || newPassword.length < 8) {
+      return res.json({ success: false, message: "Password kam se kam 8 characters ka ho." });
+    }
+    const order = await pvFindOwned(req.userId, vmId);
+    if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
+    await pvLogin();
+    const data = await pvApi(`/api/users/${pvUserId}/vms/${Number(vmId)}/password`, "PUT", { password: newPassword });
+    if (!/success|updated/i.test(data?.message || "")) {
+      return res.json({ success: false, message: data?.message || data?.error || "Password change nahi hua." });
+    }
+    order.deliveryPassword = newPassword;
+    await order.save();
+    res.json({ success: true, data });
+  } catch (err) {
+    res.json({ success: false, message: err.message });
+  }
+});
+
+// ---- User: OS list (rebuild ke liye) ----
+app.get("/api/pv/isos/:vmId", protect, async (req, res) => {
+  try {
+    const { vmId } = req.params;
+    const order = await pvFindOwned(req.userId, vmId);
+    if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
+    const details = await pvApi(`/api/users/orders/${Number(vmId)}/details`);
+    const isos = await pvApi(`/api/users/zones/${details.zoneId}/isos`);
+    res.json({ success: true, isos, zoneId: details.zoneId });
+  } catch (err) {
+    res.json({ success: false, isos: [], message: err.message });
+  }
+});
+
+// ---- User: rebuild ----
+const pvRebuildInProgress = new Set();
+app.post("/api/pv/rebuild", protect, async (req, res) => {
+  const { vmId, isoId } = req.body;
+  const lockKey = String(vmId);
+  try {
+    const order = await pvFindOwned(req.userId, vmId);
+    if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
+    if (pvRebuildInProgress.has(lockKey)) {
+      return res.json({ success: false, message: "Rebuild already chal rahi hai, thodi der wait karo." });
+    }
+    pvRebuildInProgress.add(lockKey);
+
+    const details = await pvApi(`/api/users/orders/${Number(vmId)}/details`);
+    const zoneIsos = await pvApi(`/api/users/zones/${details.zoneId}/isos`);
+    const validIso = zoneIsos.find((i) => i.id === Number(isoId));
+    if (!validIso) {
+      pvRebuildInProgress.delete(lockKey);
+      return res.json({ success: false, message: "Selected OS valid nahi hai." });
+    }
+    await pvLogin();
+    const data = await pvApi(`/api/users/${pvUserId}/vms/${Number(vmId)}/rebuild?isoId=${validIso.id}`, "POST", {});
+    setTimeout(() => pvRebuildInProgress.delete(lockKey), 3 * 60 * 1000);
+    if (data.message === "Rebuild initiated.") {
+      res.json({ success: true, data });
+    } else {
+      pvRebuildInProgress.delete(lockKey);
+      res.json({ success: false, message: data.message || "Failed" });
+    }
+  } catch (err) {
+    pvRebuildInProgress.delete(lockKey);
+    res.json({ success: false, message: err.message });
+  }
+});
+
+// ---- Admin: PrimeVM ke saare VMs (Find VM ke liye) ----
+app.get("/api/pv/admin/live-vms", protect, isAdmin, async (req, res) => {
+  try {
+    const data = await pvOverview();
+    const vms = (data.orders || []).map((v) => ({
+      vmId: v.vmId, ip: v.ipAddress || "", os: v.os || "", plan: v.serverPlan || "", status: v.liveState || "",
+    }));
+    res.json({ success: true, vms });
+  } catch (err) {
+    res.json({ success: false, message: err.message });
+  }
+});
+
+// ---- Admin: connection test ----
+app.get("/api/pv/admin/test", protect, isAdmin, async (req, res) => {
+  try {
+    await pvLogin();
+    const data = await pvOverview();
+    res.json({ success: true, loggedIn: true, vmCount: (data.orders || []).length });
+  } catch (err) {
+    res.json({ success: false, message: err.message });
+  }
+});
+
+// ---- Admin: kisi order ko PrimeVM VM se jodo ----
+app.put("/api/pv/admin/link/:orderId", protect, isAdmin, async (req, res) => {
+  try {
+    const pvVmId = Number(req.body.pvVmId);
+    if (!pvVmId) return res.status(400).json({ message: "pvVmId zaroori hai." });
+    const order = await Order.findByIdAndUpdate(req.params.orderId, { pvVmId }, { new: true });
+    if (!order) return res.status(404).json({ message: "Order nahi mila." });
+    res.json({ message: "PrimeVM VM link ho gaya.", order });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+// ==================== END PRIMEVM ROUTES ====================
 // ==================== WALLET ROUTES ====================
 
 // ---------- BALANCE DEKHO ----------
@@ -2724,6 +2968,8 @@ app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
 
     const updateFields = {};
     if (req.body.vmId !== undefined) updateFields.vmId = Number(req.body.vmId) || null;
+    if (req.body.pvVmId !== undefined) updateFields.pvVmId = Number(req.body.pvVmId) || null;
+    if (req.body.mxVmId !== undefined) updateFields.mxVmId = Number(req.body.mxVmId) || null;
     if (req.body.panelProvider !== undefined) {
   Object.assign(updateFields, buildPanelFields(req.body, true));
 }
@@ -3399,30 +3645,10 @@ app.post("/api/webhooks/cashfree", async (req, res) => {
     res.status(500).json({ message: "Webhook processing error." });
   }
 });
-app.get("/debug-hh-test", async (req, res) => {
-  try {
-    const result = await fetch(`${HOSTHEAVEN_BASE}/api/login`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: HOSTHEAVEN_EMAIL, password: HOSTHEAVEN_PASSWORD }),
-    });
-    const text = await result.text();
-    res.send(`STATUS: ${result.status}\n\nRESPONSE:\n${text}`);
-  } catch (err) {
-    res.send("ERROR: " + err.message);
-  }
-});
+
 
 // ==================== BASE ROUTE ====================
-app.get("/my-current-ip", async (req, res) => {
-  try {
-    const r = await fetch("https://api.ipify.org?format=json");
-    const data = await r.json();
-    res.json(data);
-  } catch (err) {
-    res.json({ error: err.message });
-  }
-});
+
 app.get("/", (req, res) => {
   res.send("ServerBazar API chal raha hai 🚀");
 });
