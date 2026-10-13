@@ -428,6 +428,9 @@ function escapeHtml(value) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 }
+function cleanText(value, max = 100) {
+  return String(value ?? "").replace(/[<>]/g, "").trim().slice(0, max);
+}
 // ==================== PROXY ENCRYPT/DECRYPT HELPERS ====================
 function encryptSecret(text) {
   const key = Buffer.from(process.env.ENCRYPTION_KEY, "hex");
@@ -1371,9 +1374,9 @@ app.post("/api/vps/track-selection", protect, async (req, res) => {
     logPurchaseActivity({
       user: req.userId,
       category: category === "linux" ? "linux" : "vps",
-      vpsId,
-      nameOrIp,
-      ram,
+      vpsId: cleanText(vpsId, 60),
+      nameOrIp: cleanText(nameOrIp, 100),
+      ram: cleanText(ram, 30),
       stage: "selected",
       status: "success",
       message: "Plan dekh raha hai",
