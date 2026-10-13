@@ -431,6 +431,9 @@ function escapeHtml(value) {
 function cleanText(value, max = 100) {
   return String(value ?? "").replace(/[<>]/g, "").trim().slice(0, max);
 }
+function shq(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
 // ==================== PROXY ENCRYPT/DECRYPT HELPERS ====================
 function encryptSecret(text) {
   const key = Buffer.from(process.env.ENCRYPTION_KEY, "hex");
@@ -529,7 +532,7 @@ async function setupProxyOnServer({ ip, username, password, proxyUsername, proxy
   }
 
   const userResult = await ssh.execCommand(
-    `htpasswd -b -c /etc/squid/passwd ${proxyUsername} ${proxyPassword}`
+    `htpasswd -b -c /etc/squid/passwd ${shq(proxyUsername)} ${shq(proxyPassword)}`
   );
   if (userResult.code !== 0) {
     ssh.dispose();
@@ -649,6 +652,8 @@ const userSchema = new mongoose.Schema(
     password: { type: String, required: true },
     phone: { type: String },
     role: { type: String, enum: ["user", "seller", "admin"], default: "user" },
+        lastLoginAt: { type: Date },
+    lastSeenAt: { type: Date },
   },
   { timestamps: true }
 );
@@ -895,6 +900,7 @@ function logPurchaseActivity(data) {
 }
 
 // ==================== MIDDLEWARE (auth check) ====================
+const seenCache = new Map(); // har user ka last DB-update time (DB pe load kam rakhne ke liye)
 const protect = (req, res, next) => {
   const authHeader = req.headers.authorization;
 
@@ -907,6 +913,11 @@ const protect = (req, res, next) => {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     req.userId = decoded.id;
+        const _last = seenCache.get(decoded.id) || 0;
+    if (Date.now() - _last > 120000) {
+      seenCache.set(decoded.id, Date.now());
+      User.updateOne({ _id: decoded.id }, { lastSeenAt: new Date() }).catch(() => {});
+    }
     next();
   } catch (err) {
     return res.status(401).json({ message: "Token invalid ya expire ho gaya." });
@@ -1181,6 +1192,7 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
       user.role = "admin";
       await user.save();
     }
+        await User.updateOne({ _id: user._id }, { lastLoginAt: new Date(), lastSeenAt: new Date() });
 
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
   expiresIn: "30m",
@@ -2872,6 +2884,21 @@ app.get("/api/admin/users", protect, isAdmin, async (req, res) => {
   try {
     const users = await User.find().select("-password").sort({ createdAt: -1 });
     res.json(users);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+app.get("/api/admin/user-activity", protect, isAdmin, async (req, res) => {
+  try {
+    const now = Date.now();
+    const [online, newToday, onlineUsers, recentLogins, newUsers] = await Promise.all([
+      User.countDocuments({ lastSeenAt: { $gte: new Date(now - 5 * 60 * 1000) } }),
+      User.countDocuments({ createdAt: { $gte: new Date(now - 24 * 3600 * 1000) } }),
+      User.find({ lastSeenAt: { $gte: new Date(now - 5 * 60 * 1000) } }).select("name email lastSeenAt").sort({ lastSeenAt: -1 }).limit(30),
+      User.find({ lastLoginAt: { $exists: true } }).select("name email lastLoginAt").sort({ lastLoginAt: -1 }).limit(20),
+      User.find().select("name email createdAt").sort({ createdAt: -1 }).limit(20),
+    ]);
+    res.json({ online, newToday, onlineUsers, recentLogins, newUsers });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
