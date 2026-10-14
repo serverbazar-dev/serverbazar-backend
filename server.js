@@ -2895,8 +2895,8 @@ app.get("/api/admin/user-activity", protect, isAdmin, async (req, res) => {
       User.countDocuments({ lastSeenAt: { $gte: new Date(now - 5 * 60 * 1000) } }),
       User.countDocuments({ createdAt: { $gte: new Date(now - 24 * 3600 * 1000) } }),
       User.find({ lastSeenAt: { $gte: new Date(now - 5 * 60 * 1000) } }).select("name email lastSeenAt").sort({ lastSeenAt: -1 }).limit(30),
-      User.find({ lastLoginAt: { $exists: true } }).select("name email lastLoginAt").sort({ lastLoginAt: -1 }).limit(20),
-      User.find().select("name email createdAt").sort({ createdAt: -1 }).limit(20),
+      User.find({ lastLoginAt: { $exists: true } }).select("name lastLoginAt").sort({ lastLoginAt: -1 }).limit(20),
+      User.find({ createdAt: { $gte: new Date(now - 24 * 3600 * 1000) } }).select("name email createdAt").sort({ createdAt: -1 }).limit(50),
     ]);
     res.json({ online, newToday, onlineUsers, recentLogins, newUsers });
   } catch (err) {
