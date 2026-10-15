@@ -146,79 +146,38 @@ async function getVmOverviewCached() {
   return data;
 }
 // ==================== END HOSTHEAVEN CONFIG ====================
-// ==================== METRICSX CLIENT (NAYA) ====================
+// ==================== METRICSX (Matrix Streamline API v1) ====================
 const MX = {
-  base: process.env.METRICSX_BASE,
-  email: process.env.METRICSX_EMAIL,
-  password: process.env.METRICSX_PASSWORD,
-  resellerDomain: process.env.METRICSX_RESELLER_DOMAIN,
+  base: (process.env.METRICSX_BASE || "https://my.matrixstreamline.com").replace(/\/$/, ""),
+  key: process.env.METRICSX_API_KEY,
 };
-const MX_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-let mxToken = null;
-let mxUserId = null;
-let mxLoginPromise = null;
 let mxChain = Promise.resolve();
 let mxOverviewCache = null;
 let mxOverviewTime = 0;
 
-function mxHeaders() {
-  const h = { "Content-Type": "application/json", "User-Agent": MX_UA };
-  if (MX.resellerDomain) h["X-Reseller-Domain"] = MX.resellerDomain;
-  return h;
-}
+const MX_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const mxValidId = (id) => MX_UUID_RE.test(String(id || ""));
 
-async function mxLogin() {
-  if (mxToken) return mxToken;
-  if (mxLoginPromise) return mxLoginPromise;
-  mxLoginPromise = (async () => {
-    try {
-      if (!MX.base || !MX.email || !MX.password) throw new Error("MetricsX env vars set nahi hain.");
-      const res = await fetch(`${MX.base}/api/login`, {
-        method: "POST",
-        headers: mxHeaders(),
-        body: JSON.stringify({ email: MX.email, password: MX.password }),
-      });
-      const raw = await res.text();
-      let data;
-      try { data = JSON.parse(raw); }
-      catch (e) { throw new Error(`MetricsX login: JSON nahi aaya (HTTP ${res.status}): ${raw.slice(0, 200)}`); }
-      if (!data.token) {
-        throw new Error(`MetricsX login fail (HTTP ${res.status}): ${data.message || data.error || JSON.stringify(data)}`);
-      }
-      mxToken = data.token;
-      try {
-        const payload = JSON.parse(Buffer.from(mxToken.split(".")[1], "base64").toString());
-        mxUserId = payload.userId || payload.id || payload.sub;
-      } catch (e) {}
-      setTimeout(() => { mxToken = null; }, 50 * 60 * 1000);
-      return mxToken;
-    } finally {
-      mxLoginPromise = null;
-    }
-  })();
-  return mxLoginPromise;
-}
-
-async function mxDirect(endpoint, method, body) {
-  await mxLogin();
-  const doFetch = () =>
-    fetch(`${MX.base}${endpoint}`, {
-      method,
-      headers: { ...mxHeaders(), Authorization: `Bearer ${mxToken}` },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-  let res = await doFetch();
-  if (res.status === 401 || res.status === 403) {
-    mxToken = null;
-    await mxLogin();
-    res = await doFetch();
-  }
+async function mxDirect(endpoint, method = "GET", body = null) {
+  if (!MX.key) throw new Error("METRICSX_API_KEY set nahi hai.");
+  const headers = { Authorization: `Bearer ${MX.key}`, "Content-Type": "application/json" };
+  if (method !== "GET") headers["Idempotency-Key"] = crypto.randomUUID();
+  const res = await fetch(`${MX.base}/api/v1${endpoint}`, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
   const raw = await res.text();
-  try { return JSON.parse(raw); }
-  catch (e) { throw new Error(`MetricsX JSON nahi aaya (HTTP ${res.status}): ${raw.slice(0, 200)}`); }
+  let json;
+  try { json = JSON.parse(raw); }
+  catch (e) { throw new Error(`MetricsX: JSON nahi aaya (HTTP ${res.status}): ${raw.slice(0, 150)}`); }
+  if (!res.ok) {
+    const e = json.error || {};
+    throw new Error(`MetricsX ${res.status} ${e.code || ""}: ${e.message || "error"}`);
+  }
+  return json;
 }
 
-// Requests ek-ek karke chalti hain, beech me 500ms gap
 function mxApi(endpoint, method = "GET", body = null) {
   const run = mxChain.then(() => mxDirect(endpoint, method, body));
   mxChain = run.catch(() => {}).then(() => new Promise((r) => setTimeout(r, 500)));
@@ -228,13 +187,20 @@ function mxApi(endpoint, method = "GET", body = null) {
 async function mxOverview() {
   const now = Date.now();
   if (mxOverviewCache && now - mxOverviewTime < 20000) return mxOverviewCache;
-  const data = await mxApi("/api/users/orders/overview?page=0&size=10000");
-  mxOverviewCache = data;
+  let all = [];
+  for (let page = 1; page <= 50; page++) {
+    const r = await mxApi(`/vms?per_page=100&page=${page}`);
+    const list = r.data || [];
+    all = all.concat(list);
+    if (list.length < 100) break;
+  }
+  mxOverviewCache = all;
   mxOverviewTime = now;
-  return data;
+  return all;
 }
 // ==================== END METRICSX CLIENT ====================
 // ==================== PRIMEVM CLIENT ====================
+const MX_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const PV = {
   base: process.env.PRIMEVM_BASE,
   email: process.env.PRIMEVM_EMAIL,
@@ -697,7 +663,7 @@ paymentGateway: { type: String, enum: ["razorpay", "cashfree", "wallet", "manual
 formatSolution: { type: String },
 formatSeenByUser: { type: Boolean, default: true },
 vmId: { type: Number, default: null },
-mxVmId: { type: Number, default: null },
+mxVmId: { type: String, default: null },
 pvVmId: { type: Number, default: null },
 panelProvider: { type: String, enum: ["none", "oceanvps", "hosthell"], default: "none" },
 panelUsername: { type: String, default: "" },
@@ -2279,28 +2245,27 @@ app.get("/api/admin/hostheaven-live-vms", protect, isAdmin, async (req, res) => 
   }
 });
 // ==================== END HOSTHEAVEN ROUTES ====================
-// ==================== METRICSX ROUTES (NAYA) ====================
+// ==================== METRICSX ROUTES ====================
 async function mxFindOwned(userId, vmId) {
-  return Order.findOne({ user: userId, mxVmId: Number(vmId) });
+  if (!mxValidId(vmId)) return null;
+  return Order.findOne({ user: userId, mxVmId: String(vmId) });
 }
 
-// ---- User: apne MetricsX VMs ki live state ----
 app.get("/api/mx/my-vps", protect, async (req, res) => {
   try {
     const orders = await Order.find({ user: req.userId, mxVmId: { $ne: null } });
     if (!orders.length) return res.json({ success: true, vms: [] });
     const all = await mxOverview();
-    const ids = orders.map((o) => Number(o.mxVmId));
-    const vms = (all.orders || [])
-      .filter((v) => ids.includes(Number(v.vmId)))
-      .map((v) => ({ vmId: v.vmId, liveState: v.liveState || "" }));
+    const ids = orders.map((o) => String(o.mxVmId));
+    const vms = all
+      .filter((v) => ids.includes(String(v.id)))
+      .map((v) => ({ vmId: v.id, liveState: v.power_state || "" }));
     res.json({ success: true, vms });
   } catch (err) {
     res.json({ success: false, vms: [], message: err.message });
   }
 });
 
-// ---- User: start / stop / reboot ----
 app.post("/api/mx/control", protect, async (req, res) => {
   try {
     const { vmId, action } = req.body;
@@ -2309,51 +2274,42 @@ app.post("/api/mx/control", protect, async (req, res) => {
     }
     const order = await mxFindOwned(req.userId, vmId);
     if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
-    await mxLogin();
-    const data = await mxApi(`/api/users/${mxUserId}/vms/${Number(vmId)}/control?action=${action}`, "POST", {});
-    res.json({ success: true, data });
+    const r = await mxApi(`/vms/${vmId}/power`, "POST", { action });
+    mxOverviewCache = null;
+    res.json({ success: true, data: r.data });
   } catch (err) {
     res.json({ success: false, message: err.message });
   }
 });
 
-// ---- User: password change ----
 app.post("/api/mx/change-password", protect, async (req, res) => {
   try {
     const { vmId, newPassword } = req.body;
-    if (typeof newPassword !== "string" || newPassword.length < 8) {
-      return res.json({ success: false, message: "Password kam se kam 8 characters ka ho." });
+    if (typeof newPassword !== "string" || newPassword.length < 8 || newPassword.length > 72) {
+      return res.json({ success: false, message: "Password 8 se 72 characters ka ho." });
     }
     const order = await mxFindOwned(req.userId, vmId);
     if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
-    await mxLogin();
-    const data = await mxApi(`/api/users/${mxUserId}/vms/${Number(vmId)}/password`, "PUT", { password: newPassword });
-    if (!/success/i.test(data?.message || "")) {
-      return res.json({ success: false, message: data?.message || data?.error || "Password change nahi hua." });
-    }
+    const r = await mxApi(`/vms/${vmId}/password`, "POST", { password: newPassword });
     order.deliveryPassword = newPassword;
     await order.save();
-    res.json({ success: true, data });
+    res.json({ success: true, data: r.data });
   } catch (err) {
     res.json({ success: false, message: err.message });
   }
 });
 
-// ---- User: OS list (rebuild ke liye) ----
 app.get("/api/mx/isos/:vmId", protect, async (req, res) => {
   try {
-    const { vmId } = req.params;
-    const order = await mxFindOwned(req.userId, vmId);
+    const order = await mxFindOwned(req.userId, req.params.vmId);
     if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
-    const details = await mxApi(`/api/users/orders/${Number(vmId)}/details`);
-    const isos = await mxApi(`/api/users/zones/${details.zoneId}/isos`);
-    res.json({ success: true, isos, zoneId: details.zoneId });
+    const r = await mxApi(`/vms/${req.params.vmId}/os-options`);
+    res.json({ success: true, isos: r.data || [] });
   } catch (err) {
     res.json({ success: false, isos: [], message: err.message });
   }
 });
 
-// ---- User: rebuild ----
 const mxRebuildInProgress = new Set();
 app.post("/api/mx/rebuild", protect, async (req, res) => {
   const { vmId, isoId } = req.body;
@@ -2366,34 +2322,43 @@ app.post("/api/mx/rebuild", protect, async (req, res) => {
     }
     mxRebuildInProgress.add(lockKey);
 
-    const details = await mxApi(`/api/users/orders/${Number(vmId)}/details`);
-    const zoneIsos = await mxApi(`/api/users/zones/${details.zoneId}/isos`);
-    const validIso = zoneIsos.find((i) => i.id === Number(isoId));
-    if (!validIso) {
+    const opts = (await mxApi(`/vms/${vmId}/os-options`)).data || [];
+    const validOs = opts.find((o) => o.id === Number(isoId));
+    if (!validOs) {
       mxRebuildInProgress.delete(lockKey);
       return res.json({ success: false, message: "Selected OS valid nahi hai." });
     }
-    await mxLogin();
-    const data = await mxApi(`/api/users/${mxUserId}/vms/${Number(vmId)}/rebuild?isoId=${validIso.id}`, "POST", {});
+
+    const vm = (await mxApi(`/vms/${vmId}`)).data;
+    const newPassword = crypto.randomBytes(9).toString("base64").replace(/[+/=]/g, "x") + "!9a";
+    await mxApi(`/vms/${vmId}/rebuild`, "POST", {
+      os_id: validOs.id,
+      confirm: vm.hostname,
+      password: newPassword,
+    });
+
+    order.deliveryPassword = newPassword;
+    order.deliveryOS = validOs.name;
+    await order.save();
+    mxOverviewCache = null;
+
     setTimeout(() => mxRebuildInProgress.delete(lockKey), 3 * 60 * 1000);
-    if (data.message === "Rebuild initiated.") {
-      res.json({ success: true, data });
-    } else {
-      mxRebuildInProgress.delete(lockKey);
-      res.json({ success: false, message: data.message || "Failed" });
-    }
+    res.json({ success: true, data: { message: "Rebuild initiated." } });
   } catch (err) {
     mxRebuildInProgress.delete(lockKey);
     res.json({ success: false, message: err.message });
   }
 });
 
-// ---- Admin: MetricsX ke saare VMs (Find VM ke liye) ----
 app.get("/api/mx/admin/live-vms", protect, isAdmin, async (req, res) => {
   try {
-    const data = await mxOverview();
-    const vms = (data.orders || []).map((v) => ({
-      vmId: v.vmId, ip: v.ipAddress || "", os: v.os || "", plan: v.serverPlan || "", status: v.liveState || "",
+    const all = await mxOverview();
+    const vms = all.map((v) => ({
+      vmId: v.id,
+      ip: v.primary_ip || "",
+      os: v.os?.name || "",
+      plan: v.plan?.name || "",
+      status: v.power_state || v.status || "",
     }));
     res.json({ success: true, vms });
   } catch (err) {
@@ -2401,22 +2366,20 @@ app.get("/api/mx/admin/live-vms", protect, isAdmin, async (req, res) => {
   }
 });
 
-// ---- Admin: connection test ----
 app.get("/api/mx/admin/test", protect, isAdmin, async (req, res) => {
   try {
-    await mxLogin();
-    const data = await mxOverview();
-    res.json({ success: true, loggedIn: true, vmCount: (data.orders || []).length });
+    const ping = await mxApi("/ping");
+    const all = await mxOverview();
+    res.json({ success: true, loggedIn: true, yourIp: ping.data.ip, keyAccess: ping.data.key?.access, vmCount: all.length });
   } catch (err) {
     res.json({ success: false, message: err.message });
   }
 });
 
-// ---- Admin: kisi order ko MetricsX VM se jodo ----
 app.put("/api/mx/admin/link/:orderId", protect, isAdmin, async (req, res) => {
   try {
-    const mxVmId = Number(req.body.mxVmId);
-    if (!mxVmId) return res.status(400).json({ message: "mxVmId zaroori hai." });
+    const mxVmId = String(req.body.mxVmId || "").trim();
+    if (!mxValidId(mxVmId)) return res.status(400).json({ message: "mxVmId valid UUID hona chahiye." });
     const order = await Order.findByIdAndUpdate(req.params.orderId, { mxVmId }, { new: true });
     if (!order) return res.status(404).json({ message: "Order nahi mila." });
     res.json({ message: "MetricsX VM link ho gaya.", order });
@@ -2425,12 +2388,11 @@ app.put("/api/mx/admin/link/:orderId", protect, isAdmin, async (req, res) => {
   }
 });
 
-// ---- Admin: user ka sabse naya order MetricsX VM se jodo (Manual Order ke liye) ----
 app.post("/api/mx/admin/link-latest", protect, isAdmin, async (req, res) => {
   try {
-    const mxVmId = Number(req.body.mxVmId);
+    const mxVmId = String(req.body.mxVmId || "").trim();
     const email = String(req.body.email || "").toLowerCase().trim();
-    if (!mxVmId || !email) return res.status(400).json({ message: "email aur mxVmId zaroori hai." });
+    if (!mxValidId(mxVmId) || !email) return res.status(400).json({ message: "email aur valid mxVmId (UUID) zaroori hai." });
     const user = await User.findOne({ email });
     if (!user) return res.status(404).json({ message: "User nahi mila." });
     const order = await Order.findOne({ user: user._id }).sort({ createdAt: -1 });
@@ -3021,7 +2983,7 @@ app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
     const updateFields = {};
     if (req.body.vmId !== undefined) updateFields.vmId = Number(req.body.vmId) || null;
     if (req.body.pvVmId !== undefined) updateFields.pvVmId = Number(req.body.pvVmId) || null;
-    if (req.body.mxVmId !== undefined) updateFields.mxVmId = Number(req.body.mxVmId) || null;
+    if (req.body.mxVmId !== undefined) updateFields.mxVmId = String(req.body.mxVmId || "").trim() || null;
     if (req.body.panelProvider !== undefined) {
   Object.assign(updateFields, buildPanelFields(req.body, true));
 }
