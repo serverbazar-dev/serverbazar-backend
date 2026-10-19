@@ -374,10 +374,23 @@ async function seedAdmin() {
         role: "admin",
       });
       console.log(`Admin account auto-created ✅ (${adminEmail})`);
-    } else if (admin.role !== "admin") {
-      admin.role = "admin";
-      await admin.save();
-      console.log(`Existing user promoted to admin ✅ (${adminEmail})`);
+    } else {
+      let changed = false;
+
+      // .env ka password DB ke hash se match nahi karta to update karo
+      const same = await bcrypt.compare(adminPassword, admin.password);
+      if (!same) {
+        admin.password = await bcrypt.hash(adminPassword, 10);
+        changed = true;
+        console.log("Admin password .env ke hisaab se update hua ✅");
+      }
+
+      if (admin.role !== "admin") {
+        admin.role = "admin";
+        changed = true;
+      }
+
+      if (changed) await admin.save();
     }
   } catch (err) {
     console.error("Admin seed error:", err.message);
