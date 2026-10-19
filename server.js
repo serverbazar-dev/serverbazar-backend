@@ -289,6 +289,8 @@ async function pvOverview() {
 // ==================== END PRIMEVM CLIENT ====================
 
 const app = express();
+const isSafeVmPassword = (p) =>
+  typeof p === "string" && p.length >= 8 && p.length <= 72 && !/[<>"'`\\&\s]/.test(p);
 app.set('trust proxy', 1);
 
 const allowedOrigins = [
@@ -1098,6 +1100,9 @@ app.post("/api/auth/register", authLimiter, async (req, res) => {
     if (typeof email !== "string" || typeof password !== "string" || typeof name !== "string") {
       return res.status(400).json({ message: "Invalid input format." });
     }
+    if (/[<>"'`\s]/.test(email) || email.length > 100 || name.length > 60 || /[<>"'`]/.test(name)) {
+  return res.status(400).json({ message: "Naam ya email me galat characters hain." });
+}
 
     const existingUser = await User.findOne({ email });
     if (existingUser) {
@@ -1638,7 +1643,7 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
     }
 
     // Pending record dhundo jo humne create-payment step me banaya tha
-    const pending = await PendingPayment.findOneAndDelete({ razorpayOrderId: razorpay_order_id });
+    const pending = await PendingPayment.findOneAndDelete({ razorpayOrderId: razorpay_order_id, user: req.userId });
     if (!pending) {
       return res.status(404).json({ message: "Payment record nahi mila ya already process ho chuka hai." });
     }
@@ -1724,7 +1729,7 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
       return res.status(400).json({ message: `Payment abhi confirm nahi hua (status: ${cfOrder.data.order_status}).` });
     }
 
-     const pending = await PendingPayment.findOneAndDelete({ cfOrderId: orderId });
+     const pending = await PendingPayment.findOneAndDelete({ cfOrderId: orderId, user: req.userId });
     if (!pending) {
       return res.status(404).json({ message: "Payment record nahi mila ya already process ho chuka hai." });
     }
@@ -2150,8 +2155,8 @@ app.post("/api/vps/hostheaven-control", protect, async (req, res) => {
 app.post("/api/vps/hostheaven-change-password", protect, async (req, res) => {
   try {
     const { vmId, newPassword } = req.body;
-    if (typeof newPassword !== "string" || newPassword.length < 8) {
-  return res.json({ success: false, message: "Password kam se kam 8 characters ka ho." });
+    if (!isSafeVmPassword(newPassword)) {
+  return res.json({ success: false, message: "Password 8-72 characters ka ho, aur space ya < > \" ' ` \\ & use na karo." });
 }
     const order = await findOwnedOrderByVmId(req.userId, vmId);
     if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
@@ -2285,8 +2290,8 @@ app.post("/api/mx/control", protect, async (req, res) => {
 app.post("/api/mx/change-password", protect, async (req, res) => {
   try {
     const { vmId, newPassword } = req.body;
-    if (typeof newPassword !== "string" || newPassword.length < 8 || newPassword.length > 72) {
-      return res.json({ success: false, message: "Password 8 se 72 characters ka ho." });
+    if (!isSafeVmPassword(newPassword)) {
+      return res.json({ success: false, message: "Password 8-72 characters ka ho, aur space ya < > \" ' ` \\ & use na karo." });
     }
     const order = await mxFindOwned(req.userId, vmId);
     if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
@@ -2447,8 +2452,8 @@ app.post("/api/pv/control", protect, async (req, res) => {
 app.post("/api/pv/change-password", protect, async (req, res) => {
   try {
     const { vmId, newPassword } = req.body;
-    if (typeof newPassword !== "string" || newPassword.length < 8) {
-      return res.json({ success: false, message: "Password kam se kam 8 characters ka ho." });
+    if (!isSafeVmPassword(newPassword)) {
+      return res.json({ success: false, message: "Password 8-72 characters ka ho, aur space ya < > \" ' ` \\ & use na karo." });
     }
     const order = await pvFindOwned(req.userId, vmId);
     if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
