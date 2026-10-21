@@ -335,6 +335,11 @@ const proxyConnectLimiter = rateLimit({
   max: 10,
   message: { message: "Bahut zyada connect attempts. 15 minute baad try karo." },
 });
+const renewLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 15,
+  message: { message: "Bahut zyada renewal attempts. Thodi der baad try karo." },
+});
 
 // ==================== RAZORPAY INSTANCE ====================
 // .env me RAZORPAY_KEY_ID aur RAZORPAY_KEY_SECRET set karo (secret sirf backend me, KABHI frontend me nahi)
@@ -751,6 +756,8 @@ const pendingPaymentSchema = new mongoose.Schema(
     razorpayOrderId: { type: String, unique: true, sparse: true },
 cfOrderId: { type: String, unique: true, sparse: true },
 paymentGateway: { type: String, enum: ["razorpay", "cashfree", "wallet"], default: "razorpay" },
+type: { type: String, enum: ["new", "renewal"], default: "new" },
+renewOrderId: { type: mongoose.Schema.Types.ObjectId, ref: "Order" },
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
     vpsId: { type: String, required: true },
     nameOrIp: { type: String },
@@ -765,6 +772,33 @@ paymentGateway: { type: String, enum: ["razorpay", "cashfree", "wallet"], defaul
   }
 );
 const PendingPayment = mongoose.model("PendingPayment", pendingPaymentSchema);
+// ==================== RENEWAL SCHEMA ====================
+const renewalSchema = new mongoose.Schema(
+  {
+    user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    order: { type: mongoose.Schema.Types.ObjectId, ref: "Order", required: true },
+    nameOrIp: String,
+    deliveryIp: String,
+    ram: String,
+    category: { type: String, enum: ["vps", "linux"], default: "vps" },
+    price: { type: Number, required: true },
+    days: { type: Number, default: 30 },
+    paymentGateway: { type: String, enum: ["razorpay", "cashfree", "wallet"] },
+    razorpayOrderId: String,
+    razorpayPaymentId: String,
+    cfOrderId: String,
+    cfPaymentId: String,
+    status: { type: String, enum: ["pending", "done", "cancelled"], default: "pending" },
+    previousExpiresAt: Date,
+    newExpiresAt: Date,
+    completedAt: Date,
+  },
+  { timestamps: true }
+);
+renewalSchema.index({ order: 1 }, { unique: true, partialFilterExpression: { status: "pending" } });
+renewalSchema.index({ razorpayPaymentId: 1 }, { unique: true, sparse: true });
+renewalSchema.index({ cfOrderId: 1 }, { unique: true, sparse: true });
+const Renewal = mongoose.model("Renewal", renewalSchema);
 // ==================== PASSWORD RESET OTP SCHEMA ====================
 // 10 min me khud delete ho jayega (TTL index) — jaisa PendingPayment karta hai
 const passwordResetOtpSchema = new mongoose.Schema({
@@ -957,6 +991,103 @@ function getEffectivePrice(ramOption, userRole) {
     return Number(ramOption.sellerPrice);
   }
   return Number(ramOption.price);
+}
+// ==================== RENEWAL HELPERS ====================
+const RENEW_WINDOW_DAYS = 5;
+const RENEWAL_DAYS = 30;
+
+function renewalEligibility(order) {
+  if (!["delivered", "active"].includes(order.status)) return "Ye order active nahi hai.";
+  if (!order.expiresAt) return "Is order ki expiry set nahi hai.";
+  const daysLeft = Math.ceil((new Date(order.expiresAt) - Date.now()) / 86400000);
+  if (daysLeft > RENEW_WINDOW_DAYS) return `Renewal expiry se ${RENEW_WINDOW_DAYS} din pehle khulega.`;
+  return null;
+}
+
+async function getRenewalPrice(order, userRole) {
+  let plan = null;
+  if (order.vpsId && !String(order.vpsId).startsWith("manual_")) {
+    plan = await VpsPlan.findOne({ vpsId: order.vpsId, category: order.category });
+  }
+  if (!plan && order.nameOrIp) {
+    plan = await VpsPlan.findOne({ nameOrIp: order.nameOrIp, category: order.category });
+  }
+  if (plan?.isTrial) return { error: "Trial plan renew nahi hota." };
+  const opt = plan?.ramOptions.find((o) => o.ram === order.ram);
+  const price = opt ? getEffectivePrice(opt, userRole) : Number(order.price);
+  if (!price || price <= 0) return { error: "Is order ka price set nahi hai. Support se contact karo." };
+  return { price };
+}
+
+function buildRenewalAlertMessage({ user, renewal }) {
+  return [
+    `🔄 <b>Renewal Order Mila!</b>`,
+    ``,
+    `👤 <b>Naam:</b> ${escapeHtml(user?.name)}`,
+    `📧 <b>Email:</b> ${escapeHtml(user?.email)}`,
+    `🌐 <b>IP:</b> ${escapeHtml(renewal.deliveryIp || "-")}`,
+    `📦 <b>Plan:</b> ${escapeHtml(renewal.nameOrIp)} · ${escapeHtml(renewal.ram || "-")}`,
+    `💰 <b>Paid:</b> ₹${renewal.price} (${escapeHtml(renewal.paymentGateway)})`,
+    `🆔 <b>Renewal ID:</b> <code>${escapeHtml(renewal._id)}</code>`,
+    ``,
+    `⚠️ Provider par renew karke dashboard me "Mark Renewed" dabao.`,
+  ].join("\n");
+}
+
+async function finalizeRenewal(pending, { gateway, razorpayPaymentId, cfPaymentId }) {
+  const orig = await Order.findById(pending.renewOrderId);
+  let renewal;
+  try {
+    renewal = await Renewal.create({
+      user: pending.user,
+      order: pending.renewOrderId,
+      nameOrIp: orig?.nameOrIp || pending.nameOrIp,
+      deliveryIp: orig?.deliveryIp,
+      ram: pending.ram,
+      category: pending.category,
+      price: pending.finalAmount,
+      days: RENEWAL_DAYS,
+      paymentGateway: gateway,
+      razorpayOrderId: pending.razorpayOrderId,
+      razorpayPaymentId,
+      cfOrderId: pending.cfOrderId,
+      cfPaymentId,
+    });
+  } catch (e) {
+    if (e.code === 11000) {
+      const existing = await Renewal.findOne(
+        razorpayPaymentId ? { razorpayPaymentId } : { cfOrderId: pending.cfOrderId }
+      );
+      if (existing) return existing;
+
+      await Wallet.findOneAndUpdate(
+        { user: pending.user },
+        { $inc: { balance: pending.finalAmount } },
+        { upsert: true }
+      );
+      await WalletTransaction.create({
+        user: pending.user,
+        type: "refund",
+        amount: pending.finalAmount,
+        description: `Duplicate renewal refund (${razorpayPaymentId || pending.cfOrderId})`,
+        status: "completed",
+      });
+      sendTelegramMessage(`⚠️ Duplicate renewal payment wallet me refund hua: ₹${pending.finalAmount}`);
+      return null;
+    }
+    throw e;
+  }
+  try {
+    const u = await User.findById(pending.user).select("name email");
+    sendTelegramMessage(buildRenewalAlertMessage({ user: u, renewal }));
+  } catch (e) {}
+  logPurchaseActivity({
+    user: pending.user, category: pending.category, vpsId: pending.vpsId,
+    nameOrIp: "🔄 Renewal: " + (renewal.nameOrIp || ""), ram: pending.ram,
+    gateway, stage: "verify-payment", status: "success",
+    message: "Renewal payment confirm ✅", amount: pending.finalAmount,
+  });
+  return renewal;
 }
 
 async function decrementRamStock(vpsId, category, ram) {
@@ -1688,7 +1819,7 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
     }
 
     // Pending record dhundo jo humne create-payment step me banaya tha
-    const pending = await PendingPayment.findOneAndDelete({ razorpayOrderId: razorpay_order_id, user: req.userId });
+    const pending = await PendingPayment.findOne({ razorpayOrderId: razorpay_order_id, user: req.userId });
     if (!pending) {
       return res.status(404).json({ message: "Payment record nahi mila ya already process ho chuka hai." });
     }
@@ -1717,6 +1848,19 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
     const expectedAmountInPaise = Math.round(pending.finalAmount * 100);
     if (razorpayPaymentDetails.amount !== expectedAmountInPaise) {
       return res.status(400).json({ message: "Payment amount match nahi hua." });
+    }
+
+    const claimed = await PendingPayment.findOneAndDelete({ _id: pending._id });
+    if (!claimed) {
+      return res.status(200).json({ message: "Payment already process ho chuka hai. My Orders check karo." });
+    }
+
+    if (pending.type === "renewal") {
+      const renewal = await finalizeRenewal(pending, { gateway: "razorpay", razorpayPaymentId: razorpay_payment_id });
+      if (!renewal) {
+        return res.status(200).json({ message: "Is order ka renewal pehle se process ho raha tha, aapka paisa wallet me refund kar diya gaya." });
+      }
+      return res.status(201).json({ message: "Renewal payment successful!", renewal });
     }
 
     // Ab jaake asli Order banega — payment success confirm hone ke baad
@@ -1774,7 +1918,7 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
       return res.status(400).json({ message: `Payment abhi confirm nahi hua (status: ${cfOrder.data.order_status}).` });
     }
 
-     const pending = await PendingPayment.findOneAndDelete({ cfOrderId: orderId, user: req.userId });
+    const pending = await PendingPayment.findOne({ cfOrderId: orderId, user: req.userId });
     if (!pending) {
       return res.status(404).json({ message: "Payment record nahi mila ya already process ho chuka hai." });
     }
@@ -1787,6 +1931,14 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
     if (pending.user.toString() !== req.userId) {
       return res.status(403).json({ message: "Ye payment aapki nahi hai." });
     }
+        if (pending.user.toString() !== req.userId) {
+      return res.status(403).json({ message: "Ye payment aapki nahi hai." });
+    }
+
+    const claimed = await PendingPayment.findOneAndDelete({ _id: pending._id });
+    if (!claimed) {
+      return res.status(200).json({ message: "Payment already process ho chuka hai. My Orders check karo." });
+    }
 
     let cfPaymentId;
     try {
@@ -1795,6 +1947,13 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
       cfPaymentId = success?.cf_payment_id;
     } catch (e) {
       console.warn("Cashfree payment id fetch nahi ho paya:", e.message);
+    }
+    if (pending.type === "renewal") {
+      const renewal = await finalizeRenewal(pending, { gateway: "cashfree", cfPaymentId });
+      if (!renewal) {
+        return res.status(200).json({ message: "Is order ka renewal pehle se process ho raha tha, aapka paisa wallet me refund kar diya gaya." });
+      }
+      return res.status(201).json({ message: "Renewal payment successful!", renewal });
     }
 
     const order = await Order.create({
@@ -1845,11 +2004,208 @@ app.get("/api/vps/my-orders", protect, async (req, res) => {
       filter.category = req.query.category;
     }
     const orders = await Order.find(filter).sort({ createdAt: -1 });
-    res.json(orders.map(serializeOrderForUser));
+const pend = await Renewal.find({ order: { $in: orders.map((o) => o._id) }, status: "pending" }).select("order");
+const pendSet = new Set(pend.map((r) => String(r.order)));
+res.json(orders.map((o) => ({ ...serializeOrderForUser(o), renewalPending: pendSet.has(String(o._id)) })));
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
+// ==================== RENEWAL ROUTES ====================
+app.get("/api/vps/renew/quote/:orderId", protect, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.orderId))
+      return res.status(400).json({ message: "Invalid order." });
+    const order = await Order.findOne({ _id: req.params.orderId, user: req.userId });
+    if (!order) return res.status(404).json({ message: "Order nahi mila." });
+
+    const err = renewalEligibility(order);
+    if (err) return res.status(400).json({ message: err });
+    if (await Renewal.exists({ order: order._id, status: "pending" }))
+      return res.status(400).json({ message: "Is order ka renewal pehle se process ho raha hai." });
+
+    const user = await User.findById(req.userId).select("role");
+    const q = await getRenewalPrice(order, user.role);
+    if (q.error) return res.status(400).json({ message: q.error });
+
+    const wallet = await Wallet.findOne({ user: req.userId });
+    const base = new Date(order.expiresAt) > new Date() ? new Date(order.expiresAt) : new Date();
+    res.json({
+      nameOrIp: order.nameOrIp || order.planName,
+      ram: order.ram,
+      price: q.price,
+      days: RENEWAL_DAYS,
+      currentExpiry: order.expiresAt,
+      newExpiry: new Date(base.getTime() + RENEWAL_DAYS * 86400000),
+      walletBalance: wallet ? wallet.balance : 0,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+app.post("/api/vps/renew/create-payment", protect, renewLimiter, async (req, res) => {
+  try {
+    const { orderId, gateway } = req.body;
+    const selectedGateway = ["cashfree", "razorpay", "wallet"].includes(gateway) ? gateway : ACTIVE_GATEWAY;
+    if (!mongoose.Types.ObjectId.isValid(orderId))
+      return res.status(400).json({ message: "Invalid order." });
+
+    const order = await Order.findOne({ _id: orderId, user: req.userId });
+    if (!order) return res.status(404).json({ message: "Order nahi mila." });
+
+    const err = renewalEligibility(order);
+    if (err) return res.status(400).json({ message: err });
+    if (await Renewal.exists({ order: order._id, status: "pending" }))
+      return res.status(400).json({ message: "Is order ka renewal pehle se process ho raha hai." });
+
+    const user = await User.findById(req.userId);
+    const q = await getRenewalPrice(order, user.role);
+    if (q.error) return res.status(400).json({ message: q.error });
+    const finalAmount = q.price;
+
+    const pendingBase = {
+      type: "renewal",
+      renewOrderId: order._id,
+      user: req.userId,
+      vpsId: order.vpsId || "-",
+      category: order.category,
+      nameOrIp: order.nameOrIp,
+      planName: order.planName,
+      ram: order.ram || "-",
+      price: finalAmount,
+      discountAmount: 0,
+      finalAmount,
+    };
+
+    if (selectedGateway === "wallet") {
+      const session = await mongoose.startSession();
+      try {
+        session.startTransaction();
+        const wallet = await Wallet.findOne({ user: req.userId }).session(session);
+        if (!wallet || wallet.balance < finalAmount) {
+          await session.abortTransaction();
+          session.endSession();
+          return res.status(400).json({ message: "Wallet me paise kam hain." });
+        }
+        wallet.balance -= finalAmount;
+        await wallet.save({ session });
+
+        const [renewal] = await Renewal.create([{
+          user: req.userId, order: order._id, nameOrIp: order.nameOrIp,
+          deliveryIp: order.deliveryIp, ram: order.ram, category: order.category,
+          price: finalAmount, days: RENEWAL_DAYS, paymentGateway: "wallet",
+        }], { session });
+
+        await WalletTransaction.create([{
+          user: req.userId, type: "debit", amount: finalAmount,
+          description: `Renewal: ${order.nameOrIp} (${order.deliveryIp || ""})`,
+          orderId: order._id, status: "completed",
+        }], { session });
+
+        await session.commitTransaction();
+        session.endSession();
+
+        try {
+          sendTelegramMessage(buildRenewalAlertMessage({ user, renewal }));
+        } catch (e) {}
+        return res.status(201).json({ gateway: "wallet", message: "Renewal payment ho gaya!", renewal });
+      } catch (e) {
+        await session.abortTransaction().catch(() => {});
+        session.endSession();
+        return res.status(500).json({ message: "Wallet payment fail ho gaya.", error: e.message });
+      }
+    }
+
+    if (selectedGateway === "cashfree") {
+      const cfOrderId = `sbr_${Date.now()}`;
+      const cfOrder = await cashfreeClient.PGCreateOrder({
+        order_id: cfOrderId,
+        order_amount: finalAmount,
+        order_currency: "INR",
+        customer_details: {
+          customer_id: String(req.userId),
+          customer_name: user?.name || "Customer",
+          customer_email: user?.email || "test@example.com",
+          customer_phone: user?.phone || "9999999999",
+        },
+      });
+      await PendingPayment.create({ ...pendingBase, cfOrderId, paymentGateway: "cashfree" });
+      return res.json({
+        gateway: "cashfree",
+        mode: process.env.CASHFREE_ENV === "production" ? "production" : "sandbox",
+        orderId: cfOrderId,
+        paymentSessionId: cfOrder.data.payment_session_id,
+        finalAmount,
+      });
+    }
+
+    const amountInPaise = finalAmount * 100;
+    const razorpayOrder = await razorpay.orders.create({
+      amount: amountInPaise,
+      currency: "INR",
+      receipt: `renew_${order._id}_${Date.now()}`.slice(0, 40),
+    });
+    await PendingPayment.create({ ...pendingBase, razorpayOrderId: razorpayOrder.id, paymentGateway: "razorpay" });
+    res.json({
+      gateway: "razorpay",
+      razorpayOrderId: razorpayOrder.id,
+      amount: amountInPaise,
+      currency: "INR",
+      keyId: process.env.RAZORPAY_KEY_ID,
+      finalAmount,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Renewal payment shuru karne me error", error: err.message });
+  }
+});
+
+app.get("/api/admin/renewals", protect, isAdmin, async (req, res) => {
+  try {
+    const filter = req.query.status ? { status: req.query.status } : {};
+    const renewals = await Renewal.find(filter)
+      .populate("user", "name email phone")
+      .populate("order", "deliveryIp deliveryUsername expiresAt nameOrIp")
+      .sort({ createdAt: -1 })
+      .limit(300);
+    res.json(renewals);
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+app.put("/api/admin/renewals/:id/complete", protect, isAdmin, async (req, res) => {
+  try {
+    const renewal = await Renewal.findOneAndUpdate(
+      { _id: req.params.id, status: "pending" },
+      { status: "done", completedAt: new Date() },
+      { new: true }
+    );
+    if (!renewal) return res.status(404).json({ message: "Renewal nahi mila ya pehle hi complete ho chuka hai." });
+
+    const order = await Order.findById(renewal.order);
+    if (!order) {
+      renewal.status = "pending"; renewal.completedAt = undefined;
+      await renewal.save();
+      return res.status(404).json({ message: "Original order nahi mila." });
+    }
+
+    const base = order.expiresAt && new Date(order.expiresAt) > new Date() ? new Date(order.expiresAt) : new Date();
+    const newExpiry = new Date(base.getTime() + (renewal.days || RENEWAL_DAYS) * 86400000);
+    renewal.previousExpiresAt = order.expiresAt;
+    renewal.newExpiresAt = newExpiry;
+    await renewal.save();
+
+    order.expiresAt = newExpiry;
+    if (order.status === "cancelled") order.status = "delivered";
+    await order.save();
+
+    res.json({ message: "Renewal complete! Expiry badh gayi.", renewal });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+// ==================== END RENEWAL ROUTES ====================
 // ==================== ADMIN: MANUAL ORDER CREATE ====================
 app.post("/api/admin/orders/manual-create", protect, isAdmin, async (req, res) => {
   try {
@@ -3571,6 +3927,9 @@ app.post("/api/webhooks/razorpay", async (req, res) => {
     if (alreadyExists) {
       return res.status(200).json({ message: "Order already exists." });
     }
+        if (await Renewal.findOne({ razorpayPaymentId: razorpay_payment_id })) {
+      return res.status(200).json({ message: "Renewal already exists." });
+    }
 
     const pending = await PendingPayment.findOneAndDelete({ razorpayOrderId: razorpay_order_id });
     if (!pending) {
@@ -3582,6 +3941,10 @@ app.post("/api/webhooks/razorpay", async (req, res) => {
     if (paymentEntity.amount !== expectedAmountInPaise) {
       console.error(`Webhook: amount mismatch order ${razorpay_order_id} ke liye.`);
       return res.status(200).json({ message: "Amount mismatch." });
+    }
+        if (pending.type === "renewal") {
+      await finalizeRenewal(pending, { gateway: "razorpay", razorpayPaymentId: razorpay_payment_id });
+      return res.status(200).json({ message: "Renewal created via webhook." });
     }
 
     const order = await Order.create({
@@ -3659,6 +4022,9 @@ app.post("/api/webhooks/cashfree", async (req, res) => {
     if (alreadyExists) {
       return res.status(200).json({ message: "Order already exists." });
     }
+        if (await Renewal.findOne({ cfOrderId })) {
+      return res.status(200).json({ message: "Renewal already exists." });
+    }
 
     const pending = await PendingPayment.findOneAndDelete({ cfOrderId });
     if (!pending) {
@@ -3669,6 +4035,10 @@ app.post("/api/webhooks/cashfree", async (req, res) => {
     if (Number(orderData.order_amount) !== Number(pending.finalAmount)) {
       console.error(`Cashfree webhook: amount mismatch order ${cfOrderId} ke liye.`);
       return res.status(200).json({ message: "Amount mismatch." });
+    }
+        if (pending.type === "renewal") {
+      await finalizeRenewal(pending, { gateway: "cashfree", cfPaymentId });
+      return res.status(200).json({ message: "Renewal created via webhook." });
     }
 
     const order = await Order.create({
