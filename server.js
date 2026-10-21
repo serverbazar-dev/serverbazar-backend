@@ -732,6 +732,13 @@ const couponSchema = new mongoose.Schema(
     allowedRole: { type: String, enum: ["user", "seller", "both"], default: "both" },
     assignedToEmail: { type: String, lowercase: true, trim: true, default: null },
     assignedToVpsId: { type: String, default: null },
+        vpsDiscounts: [
+      {
+        _id: false,
+        vpsId: { type: String, required: true },
+        discountValue: { type: Number, required: true, min: 1 },
+      },
+    ],
   },
   { timestamps: true }
 );
@@ -985,6 +992,19 @@ async function optionalAuth(req, res, next) {
   }
   next();
 }
+function cleanVpsDiscounts(input) {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const item of input) {
+    const vpsId = typeof item?.vpsId === "string" ? item.vpsId.trim() : "";
+    const val = Number(item?.discountValue);
+    if (!vpsId || !isFinite(val) || val <= 0 || seen.has(vpsId)) continue;
+    seen.add(vpsId);
+    out.push({ vpsId, discountValue: Math.round(val) });
+  }
+  return out;
+}
 
 // ==================== COUPON HELPER ====================
 // Ek coupon code, plan price aur user ke against valid hai ya nahi check karta hai.
@@ -1074,9 +1094,21 @@ async function checkCouponValidity(code, price, userId, category, userEmail, use
     }
   }
 
+  // ---- plan-wise discount (agar set hai) ----
+  let planWiseValue = null;
+  if (Array.isArray(coupon.vpsDiscounts) && coupon.vpsDiscounts.length > 0) {
+    const entry = coupon.vpsDiscounts.find((d) => d.vpsId === vpsId);
+    if (!entry) {
+      return { valid: false, message: "Ye coupon is plan par valid nahi hai." };
+    }
+    planWiseValue = Number(entry.discountValue);
+  }
+
   // ---- discount calculate karo ----
   let discountAmount = 0;
-  if (coupon.discountType === "flat") {
+  if (planWiseValue !== null) {
+    discountAmount = planWiseValue;
+  } else if (coupon.discountType === "flat") {
     discountAmount = coupon.discountValue;
   } else {
     discountAmount = (price * coupon.discountValue) / 100;
@@ -3264,10 +3296,12 @@ app.post("/api/admin/coupons", protect, isAdmin, async (req, res) => {
     const {
       code, discountType, discountValue, maxDiscountAmount,
       minOrderAmount, usageLimit, perUserLimit, expiresAt, active,
-      category, assignedToEmail, allowedRole, assignedToVpsId,
+      category, assignedToEmail, allowedRole, assignedToVpsId, vpsDiscounts,
     } = req.body;
 
-    if (!code || !discountType || !discountValue) {
+    const cleanedPlanWise = cleanVpsDiscounts(vpsDiscounts);
+
+    if (!code || !discountType || (!discountValue && cleanedPlanWise.length === 0)) {
       return res.status(400).json({ message: "Code, discount type aur discount value zaroori hai." });
     }
 
@@ -3279,7 +3313,7 @@ app.post("/api/admin/coupons", protect, isAdmin, async (req, res) => {
     const coupon = await Coupon.create({
       code: code.trim().toUpperCase(),
       discountType,
-      discountValue,
+      discountValue: discountValue || cleanedPlanWise[0].discountValue,
       maxDiscountAmount,
       minOrderAmount,
       usageLimit,
@@ -3290,6 +3324,7 @@ app.post("/api/admin/coupons", protect, isAdmin, async (req, res) => {
       allowedRole: (allowedRole === "user" || allowedRole === "seller") ? allowedRole : "both",
       assignedToEmail: assignedToEmail ? assignedToEmail.trim().toLowerCase() : null,
       assignedToVpsId: assignedToVpsId || null,
+      vpsDiscounts: cleanedPlanWise,
     });
 
     res.status(201).json({ message: "Coupon add ho gaya!", coupon });
@@ -3303,7 +3338,7 @@ app.put("/api/admin/coupons/:id", protect, isAdmin, async (req, res) => {
     const {
       discountType, discountValue, maxDiscountAmount,
       minOrderAmount, usageLimit, perUserLimit, expiresAt, active,
-      category, assignedToEmail, allowedRole, assignedToVpsId,
+      category, assignedToEmail, allowedRole, assignedToVpsId, vpsDiscounts,
     } = req.body;
 
     const updateFields = {};
@@ -3319,6 +3354,7 @@ app.put("/api/admin/coupons/:id", protect, isAdmin, async (req, res) => {
     if (allowedRole !== undefined) updateFields.allowedRole = (allowedRole === "user" || allowedRole === "seller") ? allowedRole : "both";
     if (assignedToEmail !== undefined) updateFields.assignedToEmail = assignedToEmail ? assignedToEmail.trim().toLowerCase() : null;
     if (assignedToVpsId !== undefined) updateFields.assignedToVpsId = assignedToVpsId || null;
+    if (vpsDiscounts !== undefined) updateFields.vpsDiscounts = cleanVpsDiscounts(vpsDiscounts);
 
     const coupon = await Coupon.findByIdAndUpdate(req.params.id, updateFields, { new: true });
     if (!coupon) {
