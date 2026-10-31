@@ -3074,6 +3074,83 @@ app.post("/api/share/:token/control", shareLimiter, async (req, res) => {
     res.json({ success: false, message: err.message });
   }
 });
+// PUBLIC: customer ke liye OS list
+app.get("/api/share/:token/isos", shareLimiter, async (req, res) => {
+  try {
+    const o = await findOrderByShareToken(req.params.token);
+    if (!o) return res.status(404).json({ success: false, isos: [], message: "Link invalid ya band hai." });
+    let isos = [];
+    if (o.pvVmId) {
+      const d = await pvApi(`/api/users/orders/${Number(o.pvVmId)}/details`);
+      isos = await pvApi(`/api/users/zones/${d.zoneId}/isos`);
+    } else if (o.mxVmId) {
+      isos = (await mxApi(`/vms/${o.mxVmId}/os-options`)).data || [];
+    } else if (o.vmId) {
+      const d = await hostHeavenAPI(`/api/users/orders/${Number(o.vmId)}/details`);
+      isos = await hostHeavenAPI(`/api/users/zones/${d.zoneId}/isos`);
+    }
+    const list = (Array.isArray(isos) ? isos : []).map(i => ({
+      id: i.id, name: i.name, windows: i.osType === "WINDOWS" || i.family === "windows",
+    }));
+    res.json({ success: true, isos: list });
+  } catch (err) {
+    res.json({ success: false, isos: [], message: err.message });
+  }
+});
+
+// PUBLIC: customer Format / Rebuild
+app.post("/api/share/:token/rebuild", shareLimiter, async (req, res) => {
+  let lockSet = null, lock = null;
+  try {
+    const o = await findOrderByShareToken(req.params.token);
+    if (!o) return res.status(404).json({ success: false, message: "Link invalid ya band hai." });
+    const isoId = Number(req.body.isoId);
+    if (!isoId) return res.status(400).json({ success: false, message: "OS select karo." });
+
+    if (o.pvVmId) { lockSet = pvRebuildInProgress; lock = String(o.pvVmId); }
+    else if (o.mxVmId) { lockSet = mxRebuildInProgress; lock = String(o.mxVmId); }
+    else if (o.vmId) { lockSet = rebuildInProgress; lock = String(o.vmId); }
+    else return res.status(400).json({ success: false, message: "VM linked nahi hai." });
+
+    if (lockSet.has(lock)) return res.json({ success: false, message: "Rebuild already chal rahi hai, thodi der wait karo." });
+    lockSet.add(lock);
+    const _set = lockSet, _lock = lock;
+    setTimeout(() => _set.delete(_lock), 3 * 60 * 1000);
+
+    if (o.pvVmId) {
+      const d = await pvApi(`/api/users/orders/${Number(o.pvVmId)}/details`);
+      const zoneIsos = await pvApi(`/api/users/zones/${d.zoneId}/isos`);
+      const valid = zoneIsos.find(i => i.id === isoId);
+      if (!valid) throw new Error("Selected OS valid nahi hai.");
+      await pvLogin();
+      const data = await pvApi(`/api/users/${pvUserId}/vms/${Number(o.pvVmId)}/rebuild?isoId=${valid.id}`, "POST", {});
+      if (data.message !== "Rebuild initiated.") throw new Error(data.message || "Failed");
+    } else if (o.mxVmId) {
+      const opts = (await mxApi(`/vms/${o.mxVmId}/os-options`)).data || [];
+      const valid = opts.find(x => x.id === isoId);
+      if (!valid) throw new Error("Selected OS valid nahi hai.");
+      const vm = (await mxApi(`/vms/${o.mxVmId}`)).data;
+      const newPassword = crypto.randomBytes(9).toString("base64").replace(/[+/=]/g, "x") + "!9a";
+      await mxApi(`/vms/${o.mxVmId}/rebuild`, "POST", { os_id: valid.id, confirm: vm.hostname, password: newPassword });
+      o.deliveryPassword = newPassword;
+      o.deliveryOS = valid.name;
+      await o.save();
+      mxOverviewCache = null;
+    } else {
+      const d = await hostHeavenAPI(`/api/users/orders/${Number(o.vmId)}/details`);
+      const zoneIsos = await hostHeavenAPI(`/api/users/zones/${d.zoneId}/isos`);
+      const valid = zoneIsos.find(i => i.id === isoId);
+      if (!valid) throw new Error("Selected OS valid nahi hai.");
+      await getHostHeavenToken();
+      const data = await hostHeavenAPI(`/api/users/${hostHeavenUserId}/vms/${Number(o.vmId)}/rebuild?isoId=${valid.id}`, "POST", {});
+      if (data.message !== "Rebuild initiated.") throw new Error(data.message || "Failed");
+    }
+    res.json({ success: true });
+  } catch (err) {
+    if (lockSet && lock) lockSet.delete(lock);
+    res.json({ success: false, message: err.message });
+  }
+});
 // ==================== END CUSTOMER SHARE LINK ====================
 // ==================== WALLET ROUTES ====================
 
