@@ -472,6 +472,7 @@ function serializeOrderForUser(order) {
     }
   }
   delete o.panelPasswordEnc;
+  delete o.shareTokenHash;
   return o;
 }
 
@@ -688,6 +689,8 @@ pvVmId: { type: Number, default: null },
 panelProvider: { type: String, enum: ["none", "oceanvps", "hosthell"], default: "none" },
 panelUsername: { type: String, default: "" },
 panelPasswordEnc: { type: String, default: "" },
+shareTokenHash: { type: String, index: true, sparse: true },
+shareEnabled: { type: Boolean, default: false },
   },
   { timestamps: true }
 );
@@ -2957,6 +2960,121 @@ app.put("/api/pv/admin/link/:orderId", protect, isAdmin, async (req, res) => {
   }
 });
 // ==================== END PRIMEVM ROUTES ====================
+// ==================== CUSTOMER SHARE LINK ====================
+const shareLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 60,
+  message: { message: "Bahut zyada requests. Thodi der baad try karo." },
+});
+const sha256 = (t) => crypto.createHash("sha256").update(t).digest("hex");
+
+async function findOrderByShareToken(token) {
+  if (typeof token !== "string" || !/^[0-9a-f]{48}$/.test(token)) return null;
+  return Order.findOne({
+    shareTokenHash: sha256(token),
+    shareEnabled: true,
+    status: { $in: ["delivered", "active"] },
+  });
+}
+
+// Link banao — sirf order ka malik (seller) bana sakta hai
+app.post("/api/vps/orders/:id/share", protect, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id))
+      return res.status(400).json({ message: "Invalid order." });
+    const order = await Order.findOne({ _id: req.params.id, user: req.userId });
+    if (!order) return res.status(404).json({ message: "Order nahi mila." });
+    if (!order.vmId && !order.mxVmId && !order.pvVmId)
+      return res.status(400).json({ message: "Is order me VM linked nahi hai." });
+
+    const token = crypto.randomBytes(24).toString("hex"); // 48 hex chars
+    order.shareTokenHash = sha256(token);
+    order.shareEnabled = true;
+    await order.save();
+    res.json({ url: `https://serverbazar.com/share.html?t=${token}` });
+  } catch (err) {
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// Link band karo
+app.delete("/api/vps/orders/:id/share", protect, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id))
+      return res.status(400).json({ message: "Invalid order." });
+    const order = await Order.findOneAndUpdate(
+      { _id: req.params.id, user: req.userId },
+      { shareEnabled: false, $unset: { shareTokenHash: 1 } }
+    );
+    if (!order) return res.status(404).json({ message: "Order nahi mila." });
+    res.json({ message: "Link band ho gaya." });
+  } catch (err) {
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// PUBLIC: customer apna VM dekhe
+app.get("/api/share/:token", shareLimiter, async (req, res) => {
+  try {
+    const o = await findOrderByShareToken(req.params.token);
+    if (!o) return res.status(404).json({ message: "Link invalid ya band hai." });
+
+    let liveState = "";
+    try {
+      if (o.pvVmId) liveState = ((await pvOverview()).orders || []).find(v => Number(v.vmId) === Number(o.pvVmId))?.liveState || "";
+      else if (o.mxVmId) liveState = (await mxOverview()).find(v => String(v.id) === String(o.mxVmId))?.power_state || "";
+      else if (o.vmId) liveState = ((await getVmOverviewCached()).orders || []).find(v => Number(v.vmId) === Number(o.vmId))?.liveState || "";
+    } catch (e) {}
+
+    res.json({
+      plan: o.nameOrIp || o.planName,
+      ram: o.ram,
+      ip: o.deliveryIp,
+      port: o.deliveryPort,
+      username: o.deliveryUsername || "root",
+      password: o.deliveryPassword,
+      os: o.deliveryOS,
+      expiresAt: o.expiresAt,
+      liveState,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// PUBLIC: start / stop / reboot
+const shareCooldown = new Map();
+app.post("/api/share/:token/control", shareLimiter, async (req, res) => {
+  try {
+    const { action } = req.body;
+    if (!["start", "stop", "reboot"].includes(action))
+      return res.status(400).json({ success: false, message: "Invalid action." });
+
+    const o = await findOrderByShareToken(req.params.token);
+    if (!o) return res.status(404).json({ success: false, message: "Link invalid ya band hai." });
+
+    const key = String(o._id);
+    if (Date.now() - (shareCooldown.get(key) || 0) < 60000)
+      return res.status(429).json({ success: false, message: "1 minute baad dobara try karo." });
+
+    if (o.pvVmId) {
+      await pvLogin();
+      await pvApi(`/api/users/${pvUserId}/vms/${Number(o.pvVmId)}/control?action=${action}`, "POST", {});
+    } else if (o.mxVmId) {
+      await mxApi(`/vms/${o.mxVmId}/power`, "POST", { action });
+      mxOverviewCache = null;
+    } else if (o.vmId) {
+      await getHostHeavenToken();
+      await hostHeavenAPI(`/api/users/${hostHeavenUserId}/vms/${Number(o.vmId)}/control?action=${action}`, "POST", {});
+    } else {
+      return res.status(400).json({ success: false, message: "VM linked nahi hai." });
+    }
+    shareCooldown.set(key, Date.now());
+    res.json({ success: true });
+  } catch (err) {
+    res.json({ success: false, message: err.message });
+  }
+});
+// ==================== END CUSTOMER SHARE LINK ====================
 // ==================== WALLET ROUTES ====================
 
 // ---------- BALANCE DEKHO ----------
@@ -3298,7 +3416,7 @@ app.put("/api/admin/users/:id/role", protect, isAdmin, async (req, res) => {
 app.get("/api/admin/orders", protect, isAdmin, async (req, res) => {
   try {
     const orders = await Order.find()
-  .select("-panelPasswordEnc")
+  .select("-panelPasswordEnc -shareTokenHash")
   .populate("user", "name email phone")
   .sort({ createdAt: -1 });
     res.json(orders);
@@ -3367,7 +3485,7 @@ app.get("/api/admin/reports/revenue/day", protect, isAdmin, async (req, res) => 
     if (category === "vps" || category === "linux") filter.category = category;
 
     const orders = await Order.find(filter)
-  .select("-panelPasswordEnc")
+  .select("-panelPasswordEnc -shareTokenHash")
   .populate("user", "name email phone")
   .sort({ createdAt: -1 });
 
@@ -3436,7 +3554,7 @@ app.delete("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
 app.get("/api/admin/format-requests", protect, isAdmin, async (req, res) => {
   try {
     const requests = await Order.find({ formatStatus: "pending" })
-  .select("-panelPasswordEnc")
+  .select("-panelPasswordEnc -shareTokenHash")
   .populate("user", "name email phone")
   .sort({ formatRequestedAt: -1 });
     res.json(requests);
