@@ -785,6 +785,9 @@ const renewalSchema = new mongoose.Schema(
     ram: String,
     category: { type: String, enum: ["vps", "linux"], default: "vps" },
     price: { type: Number, required: true },
+    originalPrice: Number,
+    couponCode: String,
+    discountAmount: { type: Number, default: 0 },
     days: { type: Number, default: 30 },
     paymentGateway: { type: String, enum: ["razorpay", "cashfree", "wallet"] },
     razorpayOrderId: String,
@@ -1019,7 +1022,7 @@ async function getRenewalPrice(order, userRole) {
   const opt = plan?.ramOptions.find((o) => o.ram === order.ram);
   const price = opt ? getEffectivePrice(opt, userRole) : Number(order.price);
   if (!price || price <= 0) return { error: "Is order ka price set nahi hai. Support se contact karo." };
-  return { price };
+    return { price, vpsId: plan ? plan.vpsId : null };
 }
 
 function buildRenewalAlertMessage({ user, renewal }) {
@@ -1030,6 +1033,9 @@ function buildRenewalAlertMessage({ user, renewal }) {
     `📧 <b>Email:</b> ${escapeHtml(user?.email)}`,
     `🌐 <b>IP:</b> ${escapeHtml(renewal.deliveryIp || "-")}`,
     `📦 <b>Plan:</b> ${escapeHtml(renewal.nameOrIp)} · ${escapeHtml(renewal.ram || "-")}`,
+    renewal.couponCode
+      ? `🏷️ <b>Coupon:</b> ${escapeHtml(renewal.couponCode)} (−₹${renewal.discountAmount})`
+      : `🏷️ <b>Coupon:</b> Koi nahi`,
     `💰 <b>Paid:</b> ₹${renewal.price} (${escapeHtml(renewal.paymentGateway)})`,
     `🆔 <b>Renewal ID:</b> <code>${escapeHtml(renewal._id)}</code>`,
     ``,
@@ -1049,6 +1055,9 @@ async function finalizeRenewal(pending, { gateway, razorpayPaymentId, cfPaymentI
       ram: pending.ram,
       category: pending.category,
       price: pending.finalAmount,
+      originalPrice: pending.price,
+      couponCode: pending.couponCode,
+      discountAmount: pending.discountAmount || 0,
       days: RENEWAL_DAYS,
       paymentGateway: gateway,
       razorpayOrderId: pending.razorpayOrderId,
@@ -1079,6 +1088,9 @@ async function finalizeRenewal(pending, { gateway, razorpayPaymentId, cfPaymentI
       return null;
     }
     throw e;
+  }
+    if (pending.couponCode) {
+    await Coupon.updateOne({ code: pending.couponCode }, { $inc: { usedCount: 1 } }).catch(() => {});
   }
   try {
     const u = await User.findById(pending.user).select("name email");
@@ -1139,6 +1151,13 @@ function cleanVpsDiscounts(input) {
   }
   return out;
 }
+async function countCouponUsage(userId, code) {
+  const [fromOrders, fromRenewals] = await Promise.all([
+    Order.countDocuments({ user: userId, couponCode: code }),
+    Renewal.countDocuments({ user: userId, couponCode: code, status: { $ne: "cancelled" } }),
+  ]);
+  return fromOrders + fromRenewals;
+}
 
 // ==================== COUPON HELPER ====================
 // Ek coupon code, plan price aur user ke against valid hai ya nahi check karta hai.
@@ -1158,10 +1177,7 @@ async function checkCouponValidity(code, price, userId, category, userEmail, use
       return { valid: false, message: "Ye coupon is order par apply nahi hoga." };
     }
 
-    const timesUsedByUser = await Order.countDocuments({
-      user: userId,
-      couponCode: secretMatch.code,
-    });
+    const timesUsedByUser = await countCouponUsage(userId, secretMatch.code);
     if (timesUsedByUser >= SECRET_COUPON_PER_USER_LIMIT) {
       return { valid: false, message: "Aap ye coupon pehle hi use kar chuke ho." };
     }
@@ -1219,10 +1235,7 @@ async function checkCouponValidity(code, price, userId, category, userEmail, use
   }
 
   if (coupon.perUserLimit != null) {
-    const timesUsedByUser = await Order.countDocuments({
-      user: userId,
-      couponCode: coupon.code,
-    });
+    const timesUsedByUser = await countCouponUsage(userId, coupon.code);
     if (timesUsedByUser >= coupon.perUserLimit) {
       return { valid: false, message: "Aap ye coupon pehle hi use kar chuke ho." };
     }
@@ -2015,6 +2028,37 @@ res.json(orders.map((o) => ({ ...serializeOrderForUser(o), renewalPending: pendS
   }
 });
 // ==================== RENEWAL ROUTES ====================
+app.post("/api/vps/renew/validate-coupon", couponLimiter, protect, async (req, res) => {
+  try {
+    const { orderId, code } = req.body;
+    if (typeof orderId !== "string" || !mongoose.Types.ObjectId.isValid(orderId))
+      return res.status(400).json({ message: "Invalid order." });
+    if (typeof code !== "string" || !code.trim() || code.length > 50)
+      return res.status(400).json({ message: "Coupon code do." });
+
+    const order = await Order.findOne({ _id: orderId, user: req.userId });
+    if (!order) return res.status(404).json({ message: "Order nahi mila." });
+
+    const eligErr = renewalEligibility(order);
+    if (eligErr) return res.status(400).json({ message: eligErr });
+
+    const user = await User.findById(req.userId).select("email role");
+    const q = await getRenewalPrice(order, user.role);
+    if (q.error) return res.status(400).json({ message: q.error });
+
+    const result = await checkCouponValidity(code, q.price, req.userId, order.category, user.email, user.role, q.vpsId);
+    if (!result.valid) return res.status(400).json({ message: result.message });
+
+    res.json({
+      message: result.message,
+      originalPrice: q.price,
+      discountAmount: result.discountAmount,
+      finalAmount: result.finalAmount,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Server error" });
+  }
+});
 app.get("/api/vps/renew/quote/:orderId", protect, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.orderId))
@@ -2049,9 +2093,9 @@ app.get("/api/vps/renew/quote/:orderId", protect, async (req, res) => {
 
 app.post("/api/vps/renew/create-payment", protect, renewLimiter, async (req, res) => {
   try {
-    const { orderId, gateway } = req.body;
+    const { orderId, gateway, couponCode } = req.body;
     const selectedGateway = ["cashfree", "razorpay", "wallet"].includes(gateway) ? gateway : ACTIVE_GATEWAY;
-    if (!mongoose.Types.ObjectId.isValid(orderId))
+    if (typeof orderId !== "string" || !mongoose.Types.ObjectId.isValid(orderId))
       return res.status(400).json({ message: "Invalid order." });
 
     const order = await Order.findOne({ _id: orderId, user: req.userId });
@@ -2065,7 +2109,22 @@ app.post("/api/vps/renew/create-payment", protect, renewLimiter, async (req, res
     const user = await User.findById(req.userId);
     const q = await getRenewalPrice(order, user.role);
     if (q.error) return res.status(400).json({ message: q.error });
-    const finalAmount = q.price;
+
+    let discountAmount = 0;
+    let finalAmount = q.price;
+    let appliedCouponCode = undefined;
+
+    if (couponCode) {
+      if (typeof couponCode !== "string" || couponCode.length > 50)
+        return res.status(400).json({ message: "Coupon code galat hai." });
+      const result = await checkCouponValidity(
+        couponCode, q.price, req.userId, order.category, user.email, user.role, q.vpsId
+      );
+      if (!result.valid) return res.status(400).json({ message: result.message });
+      discountAmount = result.discountAmount;
+      finalAmount = result.finalAmount;
+      appliedCouponCode = result.coupon.code;
+    }
 
     const pendingBase = {
       type: "renewal",
@@ -2076,8 +2135,9 @@ app.post("/api/vps/renew/create-payment", protect, renewLimiter, async (req, res
       nameOrIp: order.nameOrIp,
       planName: order.planName,
       ram: order.ram || "-",
-      price: finalAmount,
-      discountAmount: 0,
+      price: q.price,
+      couponCode: appliedCouponCode,
+      discountAmount,
       finalAmount,
     };
 
@@ -2097,7 +2157,9 @@ app.post("/api/vps/renew/create-payment", protect, renewLimiter, async (req, res
         const [renewal] = await Renewal.create([{
           user: req.userId, order: order._id, nameOrIp: order.nameOrIp,
           deliveryIp: order.deliveryIp, ram: order.ram, category: order.category,
-          price: finalAmount, days: RENEWAL_DAYS, paymentGateway: "wallet",
+          price: finalAmount, originalPrice: q.price,
+          couponCode: appliedCouponCode, discountAmount,
+          days: RENEWAL_DAYS, paymentGateway: "wallet",
         }], { session });
 
         await WalletTransaction.create([{
@@ -2105,6 +2167,10 @@ app.post("/api/vps/renew/create-payment", protect, renewLimiter, async (req, res
           description: `Renewal: ${order.nameOrIp} (${order.deliveryIp || ""})`,
           orderId: order._id, status: "completed",
         }], { session });
+
+        if (appliedCouponCode) {
+          await Coupon.updateOne({ code: appliedCouponCode }, { $inc: { usedCount: 1 } }).session(session);
+        }
 
         await session.commitTransaction();
         session.endSession();
@@ -2139,11 +2205,12 @@ app.post("/api/vps/renew/create-payment", protect, renewLimiter, async (req, res
         mode: process.env.CASHFREE_ENV === "production" ? "production" : "sandbox",
         orderId: cfOrderId,
         paymentSessionId: cfOrder.data.payment_session_id,
+        discountAmount,
         finalAmount,
       });
     }
 
-    const amountInPaise = finalAmount * 100;
+    const amountInPaise = Math.round(finalAmount * 100);
     const razorpayOrder = await razorpay.orders.create({
       amount: amountInPaise,
       currency: "INR",
@@ -2156,6 +2223,7 @@ app.post("/api/vps/renew/create-payment", protect, renewLimiter, async (req, res
       amount: amountInPaise,
       currency: "INR",
       keyId: process.env.RAZORPAY_KEY_ID,
+      discountAmount,
       finalAmount,
     });
   } catch (err) {
