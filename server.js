@@ -1749,6 +1749,7 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
       logPurchaseActivity({ user: req.userId, category: cat, vpsId, nameOrIp: plan.nameOrIp, stage: "create-payment", status: "failed", message: "Stock kisi aur ke payment me hold tha." });
       return res.status(409).json({ message: "Ye IP abhi kisi aur user ke payment me hold hai. Try krte rho krte rho." });
     }
+        if (selectedGateway === "wallet") {
       const session = await mongoose.startSession();
       try {
         session.startTransaction();
