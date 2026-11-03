@@ -926,6 +926,60 @@ function logPurchaseActivity(data) {
     console.error("Purchase activity log error:", e.message)
   );
 }
+// ==================== STOCK HOLD ====================
+const HOLD_SECONDS = 180; // 3 minute
+const stockHoldSchema = new mongoose.Schema(
+  {
+    user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    vpsId: { type: String, required: true },
+    category: { type: String, enum: ["vps", "linux"], default: "vps" },
+    released: { type: Boolean, default: false },
+    expiresAt: { type: Date, required: true, expires: 0 },
+  },
+  { timestamps: true }
+);
+const StockHold = mongoose.model("StockHold", stockHoldSchema);
+
+const planLocks = new Map();
+function withPlanLock(key, fn) {
+  const prev = planLocks.get(key) || Promise.resolve();
+  const run = prev.then(fn, fn);
+  planLocks.set(key, run.catch(() => {}));
+  return run;
+}
+
+async function countActiveHolds(vpsId, category, excludeUserId) {
+  const holds = await StockHold.find({
+    vpsId, category, released: false,
+    expiresAt: { $gt: new Date() },
+    user: { $ne: excludeUserId },
+  });
+  let n = 0;
+  for (const h of holds) {
+    const bought = await Order.exists({ user: h.user, vpsId, createdAt: { $gte: h.createdAt } });
+    if (bought) { h.released = true; await h.save(); }
+    else n++;
+  }
+  return n;
+}
+
+async function reserveStock(userId, plan, cat) {
+  return withPlanLock(`${cat}:${plan.vpsId}`, async () => {
+    const fresh = await VpsPlan.findOne({ vpsId: plan.vpsId, category: cat });
+    if (!fresh || fresh.stockQty == null) return { ok: true }; // unlimited
+    await StockHold.updateMany(
+      { user: userId, vpsId: plan.vpsId, category: cat, released: false },
+      { released: true }
+    );
+    const held = await countActiveHolds(plan.vpsId, cat, userId);
+    if (fresh.stockQty - held <= 0) return { ok: false };
+    await StockHold.create({
+      user: userId, vpsId: plan.vpsId, category: cat,
+      expiresAt: new Date(Date.now() + HOLD_SECONDS * 1000),
+    });
+    return { ok: true };
+  });
+}
 
 // ==================== MIDDLEWARE (auth check) ====================
 const seenCache = new Map(); // har user ka last DB-update time (DB pe load kam rakhne ke liye)
@@ -1561,6 +1615,27 @@ app.post("/api/vps/track-selection", protect, async (req, res) => {
     res.status(500).json({ ok: false });
   }
 });
+app.post("/api/vps/release-hold", protect, async (req, res) => {
+  try {
+    const { vpsId, category } = req.body;
+    await StockHold.updateMany(
+      { user: req.userId, vpsId: String(vpsId || ""), category: category === "linux" ? "linux" : "vps", released: false },
+      { released: true }
+    );
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false }); }
+});
+
+app.post("/api/vps/hold-ping", protect, async (req, res) => {
+  try {
+    const { vpsId, category } = req.body;
+    await StockHold.updateMany(
+      { user: req.userId, vpsId: String(vpsId || ""), category: category === "linux" ? "linux" : "vps", released: false },
+      { expiresAt: new Date(Date.now() + HOLD_SECONDS * 1000) }
+    );
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false }); }
+});
 
 // ---------- COUPON VALIDATE KARO (LOGIN REQUIRED) ----------
 // Modal me "Apply" button dabane par ye call hoga — payment shuru karne se pehle
@@ -1668,6 +1743,11 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
       discountAmount = result.discountAmount;
       finalAmount = result.finalAmount;
       appliedCouponCode = result.coupon.code;
+    }
+        const hold = await reserveStock(req.userId, plan, cat);
+    if (!hold.ok) {
+      logPurchaseActivity({ user: req.userId, category: cat, vpsId, nameOrIp: plan.nameOrIp, stage: "create-payment", status: "failed", message: "Stock kisi aur ke payment me hold tha." });
+      return res.status(409).json({ message: "Ye IP abhi kisi aur user ke payment me hold hai. 2-3 minute baad try karo." });
     }
     if (selectedGateway === "wallet") {
       const session = await mongoose.startSession();
