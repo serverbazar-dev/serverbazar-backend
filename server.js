@@ -3108,6 +3108,73 @@ app.put("/api/pv/admin/link/:orderId", protect, isAdmin, async (req, res) => {
   }
 });
 // ==================== END PRIMEVM ROUTES ====================
+// ==================== NETWORK REPAIR (NAYA) ====================
+// Ye route VM ka network dobara configure karta hai. Dhyan: VM reboot hota hai.
+// Abuse na ho isliye har VM par 5 minute ka cooldown hai.
+const networkRepairCooldown = new Map();
+const NETWORK_REPAIR_COOLDOWN_MS = 5 * 60 * 1000;
+
+function networkRepairWaitSeconds(key) {
+  const left = NETWORK_REPAIR_COOLDOWN_MS - (Date.now() - (networkRepairCooldown.get(key) || 0));
+  return left > 0 ? Math.ceil(left / 1000) : 0;
+}
+
+// ---- HostHeaven VM ke liye ----
+app.post("/api/vps/hostheaven-network-repair", protect, async (req, res) => {
+  try {
+    const { vmId } = req.body;
+    const order = await findOwnedOrderByVmId(req.userId, vmId);
+    if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
+    if (!["delivered", "active"].includes(order.status)) {
+      return res.json({ success: false, message: "Ye order abhi active nahi hai." });
+    }
+
+    const key = `hh_${Number(vmId)}`;
+    const wait = networkRepairWaitSeconds(key);
+    if (wait > 0) {
+      return res.json({ success: false, message: `${wait} second baad dobara try karo.` });
+    }
+
+    const data = await hostHeavenAPI(`/api/users/vms/${Number(vmId)}/reconfigure-network`, "POST", {});
+    if (!/initiated|success/i.test(data?.message || "")) {
+      return res.json({ success: false, message: data?.message || data?.error || "Network repair nahi ho paya." });
+    }
+
+    networkRepairCooldown.set(key, Date.now());
+    res.json({ success: true, message: data.message });
+  } catch (err) {
+    res.json({ success: false, message: err.message });
+  }
+});
+
+// ---- PrimeVM VM ke liye ----
+app.post("/api/pv/network-repair", protect, async (req, res) => {
+  try {
+    const { vmId } = req.body;
+    const order = await pvFindOwned(req.userId, vmId);
+    if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
+    if (!["delivered", "active"].includes(order.status)) {
+      return res.json({ success: false, message: "Ye order abhi active nahi hai." });
+    }
+
+    const key = `pv_${Number(vmId)}`;
+    const wait = networkRepairWaitSeconds(key);
+    if (wait > 0) {
+      return res.json({ success: false, message: `${wait} second baad dobara try karo.` });
+    }
+
+    const data = await pvApi(`/api/users/vms/${Number(vmId)}/reconfigure-network`, "POST", {});
+    if (!/initiated|success/i.test(data?.message || "")) {
+      return res.json({ success: false, message: data?.message || data?.error || "Network repair nahi ho paya." });
+    }
+
+    networkRepairCooldown.set(key, Date.now());
+    res.json({ success: true, message: data.message });
+  } catch (err) {
+    res.json({ success: false, message: err.message });
+  }
+});
+// ==================== END NETWORK REPAIR ====================
 // ==================== CUSTOMER SHARE LINK ====================
 const shareLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, max: 60,
