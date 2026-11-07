@@ -1018,6 +1018,81 @@ const isAdmin = async (req, res, next) => {
     res.status(500).json({ message: "Server error", error: err.message });
   }
 };
+// ==================== VM CONTROL LOCK (ADMIN SWITCH) ====================
+const VM_CONTROL_KEYS = ["start", "stop", "reboot", "password", "rebuild", "network"];
+
+const vmControlSettingSchema = new mongoose.Schema(
+  {
+    key: { type: String, default: "vm_controls", unique: true },
+    disabled: { type: mongoose.Schema.Types.Mixed, default: {} },
+    notice: { type: String, default: "" },
+  },
+  { timestamps: true }
+);
+const VmControlSetting = mongoose.model("VmControlSetting", vmControlSettingSchema);
+
+async function getVmControlSettings() {
+  const doc = await VmControlSetting.findOne({ key: "vm_controls" }).lean();
+  const disabled = {};
+  VM_CONTROL_KEYS.forEach((k) => { disabled[k] = !!(doc && doc.disabled && doc.disabled[k]); });
+  return { disabled, notice: (doc && doc.notice) || "" };
+}
+
+const guardVm = (feature) => async (req, res, next) => {
+  try {
+    const key = typeof feature === "function" ? feature(req) : feature;
+    if (!VM_CONTROL_KEYS.includes(key)) return next();
+    const s = await getVmControlSettings();
+    if (s.disabled[key]) {
+      return res.status(423).json({
+        success: false,
+        locked: true,
+        message: s.notice || "Ye feature abhi admin ne band kiya hua hai.",
+      });
+    }
+    next();
+  } catch (e) {
+    next();
+  }
+};
+const actionKey = (req) => req.body && req.body.action;
+
+app.get("/api/vm-controls", protect, async (req, res) => {
+  try { res.json(await getVmControlSettings()); }
+  catch (e) { res.status(500).json({ message: "Server error" }); }
+});
+
+app.get("/api/admin/vm-controls", protect, isAdmin, async (req, res) => {
+  try { res.json(await getVmControlSettings()); }
+  catch (e) { res.status(500).json({ message: "Server error" }); }
+});
+
+app.put("/api/admin/vm-controls", protect, isAdmin, async (req, res) => {
+  try {
+    const input = req.body.disabled || {};
+    const disabled = {};
+    VM_CONTROL_KEYS.forEach((k) => { disabled[k] = input[k] === true; });
+    const notice = String(req.body.notice || "").trim().slice(0, 500);
+
+    await VmControlSetting.findOneAndUpdate(
+      { key: "vm_controls" },
+      { disabled, notice },
+      { upsert: true, new: true }
+    );
+
+    const off = VM_CONTROL_KEYS.filter((k) => disabled[k]);
+    try {
+      sendTelegramMessage(
+        `🔒 <b>VM Controls Updated</b>\n\nBand: ${off.length ? off.join(", ") : "Koi nahi (sab chalu)"}\n📝 Notice: ${escapeHtml(notice || "-")}`
+      );
+    } catch (e) {}
+
+    res.json({ message: "Settings save ho gayi.", disabled, notice });
+  } catch (e) {
+    res.status(500).json({ message: "Server error", error: e.message });
+  }
+});
+// ==================== END VM CONTROL LOCK ====================
 
 // ==================== SECRET (.env) COUPONS ====================
 // Ye coupons DATABASE me kabhi save nahi hote — sirf .env se load hote hain.
@@ -2689,7 +2764,7 @@ app.get("/api/vps/my-hostheaven-vps", protect, async (req, res) => {
   }
 });
 
-app.post("/api/vps/hostheaven-control", protect, async (req, res) => {
+app.post("/api/vps/hostheaven-control", protect, guardVm(actionKey), async (req, res) => {
   try {
     const { vmId, action } = req.body;
     if (!["start", "stop", "reboot"].includes(action)) {
@@ -2704,7 +2779,7 @@ app.post("/api/vps/hostheaven-control", protect, async (req, res) => {
   }
 });
 
-app.post("/api/vps/hostheaven-change-password", protect, async (req, res) => {
+app.post("/api/vps/hostheaven-change-password", protect, guardVm("password"), async (req, res) => {
   try {
     const { vmId, newPassword } = req.body;
     if (!isSafeVmPassword(newPassword)) {
@@ -2742,7 +2817,7 @@ app.get("/api/vps/hostheaven-isos/:vmId", protect, async (req, res) => {
 });
 
 const rebuildInProgress = new Set();
-app.post("/api/vps/hostheaven-rebuild", protect, async (req, res) => {
+app.post("/api/vps/hostheaven-rebuild", protect, guardVm("rebuild"), async (req, res) => {
   try {
     const { vmId, isoId } = req.body;
     const order = await findOwnedOrderByVmId(req.userId, vmId);
@@ -2823,7 +2898,7 @@ app.get("/api/mx/my-vps", protect, async (req, res) => {
   }
 });
 
-app.post("/api/mx/control", protect, async (req, res) => {
+app.post("/api/mx/control", protect, guardVm(actionKey), async (req, res) => {
   try {
     const { vmId, action } = req.body;
     if (!["start", "stop", "reboot"].includes(action)) {
@@ -2839,7 +2914,7 @@ app.post("/api/mx/control", protect, async (req, res) => {
   }
 });
 
-app.post("/api/mx/change-password", protect, async (req, res) => {
+app.post("/api/mx/change-password", protect, guardVm("password"), async (req, res) => {
   try {
     const { vmId, newPassword } = req.body;
     if (!isSafeVmPassword(newPassword)) {
@@ -2868,7 +2943,7 @@ app.get("/api/mx/isos/:vmId", protect, async (req, res) => {
 });
 
 const mxRebuildInProgress = new Set();
-app.post("/api/mx/rebuild", protect, async (req, res) => {
+app.post("/api/mx/rebuild", protect, guardVm("rebuild"), async (req, res) => {
   const { vmId, isoId } = req.body;
   const lockKey = String(vmId);
   try {
@@ -2984,7 +3059,7 @@ app.get("/api/pv/my-vps", protect, async (req, res) => {
 });
 
 // ---- User: start / stop / reboot ----
-app.post("/api/pv/control", protect, async (req, res) => {
+app.post("/api/pv/control", protect, guardVm(actionKey), async (req, res) => {
   try {
     const { vmId, action } = req.body;
     if (!["start", "stop", "reboot"].includes(action)) {
@@ -3001,7 +3076,7 @@ app.post("/api/pv/control", protect, async (req, res) => {
 });
 
 // ---- User: password change ----
-app.post("/api/pv/change-password", protect, async (req, res) => {
+app.post("/api/pv/change-password", protect, guardVm("password"), async (req, res) => {
   try {
     const { vmId, newPassword } = req.body;
     if (!isSafeVmPassword(newPassword)) {
@@ -3038,7 +3113,7 @@ app.get("/api/pv/isos/:vmId", protect, async (req, res) => {
 
 // ---- User: rebuild ----
 const pvRebuildInProgress = new Set();
-app.post("/api/pv/rebuild", protect, async (req, res) => {
+app.post("/api/pv/rebuild", protect, guardVm("rebuild"), async (req, res) => {
   const { vmId, isoId } = req.body;
   const lockKey = String(vmId);
   try {
@@ -3120,7 +3195,7 @@ function networkRepairWaitSeconds(key) {
 }
 
 // ---- HostHeaven VM ke liye ----
-app.post("/api/vps/hostheaven-network-repair", protect, async (req, res) => {
+app.post("/api/vps/hostheaven-network-repair", protect, guardVm("network"), async (req, res) => {
   try {
     const { vmId } = req.body;
     const order = await findOwnedOrderByVmId(req.userId, vmId);
@@ -3148,7 +3223,7 @@ app.post("/api/vps/hostheaven-network-repair", protect, async (req, res) => {
 });
 
 // ---- PrimeVM VM ke liye ----
-app.post("/api/pv/network-repair", protect, async (req, res) => {
+app.post("/api/pv/network-repair", protect, guardVm("network"), async (req, res) => {
   try {
     const { vmId } = req.body;
     const order = await pvFindOwned(req.userId, vmId);
@@ -3258,7 +3333,7 @@ app.get("/api/share/:token", shareLimiter, async (req, res) => {
 
 // PUBLIC: start / stop / reboot
 const shareCooldown = new Map();
-app.post("/api/share/:token/control", shareLimiter, async (req, res) => {
+app.post("/api/share/:token/control", shareLimiter, guardVm(actionKey), async (req, res) => {
   try {
     const { action } = req.body;
     if (!["start", "stop", "reboot"].includes(action))
@@ -3314,7 +3389,7 @@ app.get("/api/share/:token/isos", shareLimiter, async (req, res) => {
 });
 
 // PUBLIC: customer Format / Rebuild
-app.post("/api/share/:token/rebuild", shareLimiter, async (req, res) => {
+app.post("/api/share/:token/rebuild", shareLimiter, guardVm("rebuild"), async (req, res) => {
   let lockSet = null, lock = null;
   try {
     const o = await findOrderByShareToken(req.params.token);
