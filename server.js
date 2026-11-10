@@ -317,6 +317,53 @@ app.use(express.json({
     req.rawBody = buf;
   }
 }));
+// ==================== MAINTENANCE MODE ====================
+const maintenanceSchema = new mongoose.Schema(
+  {
+    key: { type: String, default: "site", unique: true },
+    enabled: { type: Boolean, default: false },
+    message: { type: String, default: "Server under maintenance. Thodi der baad aana." },
+  },
+  { timestamps: true }
+);
+const Maintenance = mongoose.model("Maintenance", maintenanceSchema);
+
+let maintCache = { enabled: false, message: "", at: 0 };
+async function getMaintenance() {
+  if (Date.now() - maintCache.at < 5000) return maintCache;
+  try {
+    const doc = await Maintenance.findOne({ key: "site" }).lean();
+    maintCache = {
+      enabled: !!(doc && doc.enabled),
+      message: (doc && doc.message) || "Server under maintenance. Thodi der baad aana.",
+      at: Date.now(),
+    };
+  } catch (e) {}
+  return maintCache;
+}
+
+const MAINT_ALLOWED = [
+  "/api/maintenance-status",
+  "/api/admin",
+  "/api/webhooks",
+  "/api/auth/login",
+  "/api/auth/me",
+];
+
+app.use(async (req, res, next) => {
+  if (!req.path.startsWith("/api")) return next();
+  if (req.path.includes("/admin")) return next();   // naya: sab admin routes allowed
+  if (MAINT_ALLOWED.some((p) => req.path.startsWith(p))) return next();
+  const m = await getMaintenance();
+  if (!m.enabled) return next();
+  return res.status(503).json({ maintenance: true, message: m.message });
+});
+
+app.get("/api/maintenance-status", async (req, res) => {
+  const m = await getMaintenance();
+  res.json({ enabled: m.enabled, message: m.message });
+});
+// ==================== END MAINTENANCE MODE ====================
 // Login/Register ke liye limiter — 15 min me max 30 tries per IP
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -1093,6 +1140,28 @@ app.put("/api/admin/vm-controls", protect, isAdmin, async (req, res) => {
   }
 });
 // ==================== END VM CONTROL LOCK ====================
+app.get("/api/admin/maintenance", protect, isAdmin, async (req, res) => {
+  maintCache.at = 0;
+  const m = await getMaintenance();
+  res.json({ enabled: m.enabled, message: m.message });
+});
+
+app.put("/api/admin/maintenance", protect, isAdmin, async (req, res) => {
+  try {
+    const enabled = req.body.enabled === true;
+    const message = String(req.body.message || "").trim().slice(0, 300) ||
+      "Server under maintenance. Thodi der baad aana.";
+    await Maintenance.findOneAndUpdate(
+      { key: "site" },
+      { enabled, message },
+      { upsert: true, new: true }
+    );
+    maintCache = { enabled, message, at: Date.now() };
+    res.json({ message: enabled ? "Maintenance ON" : "Maintenance OFF", enabled, message });
+  } catch (e) {
+    res.status(500).json({ message: "Server error", error: e.message });
+  }
+});
 
 // ==================== SECRET (.env) COUPONS ====================
 // Ye coupons DATABASE me kabhi save nahi hote — sirf .env se load hote hain.
