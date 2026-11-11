@@ -542,41 +542,75 @@ async function setupProxyOnServer({ ip, username, password, proxyUsername, proxy
   const ssh = new NodeSSH();
   await ssh.connect({ host: ip, username, password, readyTimeout: 30000 });
 
-  if (forceReinstall) {
-    await ssh.execCommand("command -v squid-uninstall >/dev/null 2>&1 && squid-uninstall || true");
-  }
+  try {
+    const run = (cmd) => ssh.execCommand(cmd);
 
-  const installResult = await ssh.execCommand(
-    "wget -q https://raw.githubusercontent.com/serverok/squid-proxy-installer/master/squid3-install.sh -O /root/squid3-install.sh && bash /root/squid3-install.sh"
-  );
+    if (forceReinstall) {
+      await run("command -v squid-uninstall >/dev/null 2>&1 && squid-uninstall || true");
+    }
 
-  const outputText = (installResult.stdout || "") + (installResult.stderr || "");
-  if (/already installed/i.test(outputText)) {
-    ssh.dispose();
-    const err = new Error("Squid pehle se installed hai is server par.");
-    err.alreadyInstalled = true;
-    throw err;
-  }
-
-  if (installResult.code !== 0) {
-    ssh.dispose();
-    throw new Error(
-      `Squid install fail hua (exit code: ${installResult.code}):\nSTDOUT: ${installResult.stdout || "(khaali)"}\nSTDERR: ${installResult.stderr || "(khaali)"}`
+    // wget na ho to pehle install karo
+    await run(
+      "command -v wget >/dev/null 2>&1 || { " +
+      "if command -v apt-get >/dev/null 2>&1; then apt-get update -y >/dev/null 2>&1; apt-get install -y wget >/dev/null 2>&1; " +
+      "elif command -v dnf >/dev/null 2>&1; then dnf install -y wget >/dev/null 2>&1; " +
+      "elif command -v yum >/dev/null 2>&1; then yum install -y wget >/dev/null 2>&1; fi; }"
     );
-  }
 
-  const userResult = await ssh.execCommand(
-    `htpasswd -b -c /etc/squid/passwd ${shq(proxyUsername)} ${shq(proxyPassword)}`
-  );
-  if (userResult.code !== 0) {
+    const installResult = await run(
+      "wget -q https://raw.githubusercontent.com/serverok/squid-proxy-installer/master/squid3-install.sh -O /root/squid3-install.sh && bash /root/squid3-install.sh"
+    );
+
+    const outputText = (installResult.stdout || "") + (installResult.stderr || "");
+    if (/already installed/i.test(outputText)) {
+      const err = new Error("Squid pehle se installed hai is server par.");
+      err.alreadyInstalled = true;
+      throw err;
+    }
+    if (installResult.code !== 0) {
+      throw new Error(
+        `Squid install fail hua (exit code: ${installResult.code}):\nSTDOUT: ${installResult.stdout || "(khaali)"}\nSTDERR: ${installResult.stderr || "(khaali)"}`
+      );
+    }
+
+    // htpasswd na ho to install karo
+    await run(
+      "command -v htpasswd >/dev/null 2>&1 || { " +
+      "if command -v apt-get >/dev/null 2>&1; then apt-get install -y apache2-utils >/dev/null 2>&1; " +
+      "elif command -v dnf >/dev/null 2>&1; then dnf install -y httpd-tools >/dev/null 2>&1; " +
+      "elif command -v yum >/dev/null 2>&1; then yum install -y httpd-tools >/dev/null 2>&1; fi; }"
+    );
+
+    const userResult = await run(
+      `htpasswd -b -c /etc/squid/passwd ${shq(proxyUsername)} ${shq(proxyPassword)}`
+    );
+    if (userResult.code !== 0) {
+      throw new Error(`User add nahi ho paya:\n${userResult.stderr}`);
+    }
+
+    // Firewall me sirf port 3128 kholo (firewall band nahi karte)
+    await run(
+      "if command -v ufw >/dev/null 2>&1; then ufw allow 3128/tcp >/dev/null 2>&1 || true; fi; " +
+      "if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then " +
+      "firewall-cmd --permanent --add-port=3128/tcp >/dev/null 2>&1; firewall-cmd --reload >/dev/null 2>&1; fi; " +
+      "if command -v iptables >/dev/null 2>&1; then " +
+      "iptables -C INPUT -p tcp --dport 3128 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 3128 -j ACCEPT 2>/dev/null || true; fi"
+    );
+
+    // reload ki jagah restart + enable
+    await run("systemctl enable squid >/dev/null 2>&1; systemctl restart squid || service squid restart");
+
+    // Check karo ki port 3128 sach me listen kar raha hai
+    const check = await run("sleep 3; (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) | grep -E ':3128\\b'");
+    if (!check.stdout || !check.stdout.includes("3128")) {
+      const why = await run("systemctl status squid --no-pager 2>&1 | tail -n 15; squid -k parse 2>&1 | tail -n 10");
+      throw new Error(`Squid chal nahi raha (port 3128 listen nahi kar raha):\n${why.stdout || why.stderr || "(koi detail nahi)"}`);
+    }
+
+    return { proxyIp: ip, proxyPort: 3128, proxyUsername, proxyPassword };
+  } finally {
     ssh.dispose();
-    throw new Error(`User add nahi ho paya:\n${userResult.stderr}`);
   }
-
-  await ssh.execCommand("systemctl reload squid");
-  ssh.dispose();
-
-  return { proxyIp: ip, proxyPort: 3128, proxyUsername, proxyPassword };
 }
 
 // Ek chat id ko ek message bhejta hai (single request)
