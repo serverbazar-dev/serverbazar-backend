@@ -1947,14 +1947,10 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
 
         await decrementRamStock(plan.vpsId, cat, selectedOption.ram);
 
-        try {
-          const orderedByUser = await User.findById(order.user).select("name email");
-          sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
-        } catch (e) {}
-
+      
         logPurchaseActivity({ user: req.userId, category: cat, vpsId: plan.vpsId, nameOrIp: plan.nameOrIp, ram: selectedOption.ram, gateway: "wallet", stage: "create-payment", status: "success", message: "Order confirm ✅", amount: finalAmount });
 
-        const finalOrder = await autoDeliverOrder(order);
+        const finalOrder = await deliverAndAlert(order);
         return res.status(201).json({ gateway: "wallet", message: "Wallet se payment ho gaya! Order confirm.", order: finalOrder });
       } catch (err) {
         await session.abortTransaction();
@@ -2134,17 +2130,8 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
     }
         logPurchaseActivity({ user: pending.user, category: pending.category, vpsId: pending.vpsId, nameOrIp: pending.nameOrIp, ram: pending.ram, gateway: "razorpay", stage: "verify-payment", status: "success", message: "Payment confirm ✅", amount: pending.finalAmount });
 
-  
-    // ---- Telegram alert: admin ko turant naya order notify karo ----
-    // Ye fire-and-forget hai — Telegram fail bhi ho jaye to order response par asar nahi padega.
-    try {
-      const orderedByUser = await User.findById(order.user).select("name email");
-      sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
-    } catch (alertErr) {
-      console.error("Telegram alert bhejte waqt error:", alertErr.message);
-    }
 
-    const finalOrder = await autoDeliverOrder(order);
+    const finalOrder = await deliverAndAlert(order);
     res.status(201).json({ message: "Payment successful! Order confirm ho gaya.", order: finalOrder });
   } catch (err) {
     res.status(500).json({ message: "Payment verify karte waqt error", error: err.message });
@@ -2228,14 +2215,8 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
 
     logPurchaseActivity({ user: pending.user, category: pending.category, vpsId: pending.vpsId, nameOrIp: pending.nameOrIp, ram: pending.ram, gateway: "cashfree", stage: "verify-payment", status: "success", message: "Payment confirm ✅", amount: pending.finalAmount });
     
-    try {
-      const orderedByUser = await User.findById(order.user).select("name email");
-      sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
-    } catch (alertErr) {
-      console.error("Telegram alert bhejte waqt error:", alertErr.message);
-    }
-
-    const finalOrder = await autoDeliverOrder(order);
+   
+    const finalOrder = await deliverAndAlert(order);
     res.status(201).json({ message: "Payment successful! Order confirm ho gaya.", order: finalOrder });
   } catch (err) {
     res.status(500).json({ message: "Payment verify karte waqt error", error: err.message });
@@ -4539,12 +4520,7 @@ app.post("/api/webhooks/razorpay", async (req, res) => {
       message: "Payment confirm ✅ (webhook se)", amount: pending.finalAmount,
     });
 
-    try {
-      const orderedByUser = await User.findById(order.user).select("name email");
-      sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
-    } catch (e) {}
-
-    await autoDeliverOrder(order);
+    await deliverAndAlert(order);
     res.status(200).json({ message: "Order created via webhook." });
   } catch (err) {
     console.error("Razorpay webhook error:", err.message);
@@ -4635,12 +4611,7 @@ app.post("/api/webhooks/cashfree", async (req, res) => {
       message: "Payment confirm ✅ (webhook se)", amount: pending.finalAmount,
     });
 
-    try {
-      const orderedByUser = await User.findById(order.user).select("name email");
-      sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
-    } catch (e) {}
-
-        await autoDeliverOrder(order);
+    await deliverAndAlert(order);
     res.status(200).json({ message: "Order created via webhook." });
   } catch (err) {
     console.error("Cashfree webhook error:", err.message);
@@ -4696,6 +4667,19 @@ async function syncPlanStockFromPool(vpsId, category) {
       console.error("syncPlanStockFromPool error:", err.message);
     }
   });
+}
+// Order ke baad sirf ek alert bhejta hai:
+// deliver ho gaya to "Auto Delivered Order" (autoDeliverOrder khud bhejta hai),
+// nahi hua (stock nahi mila) to "Naya Order Mila"
+async function deliverAndAlert(order) {
+  const finalOrder = await autoDeliverOrder(order);
+  try {
+    if (!(finalOrder && finalOrder.status === "delivered")) {
+      const u = await User.findById(order.user).select("name email");
+      sendTelegramMessage(buildOrderAlertMessage({ user: u, order: finalOrder || order }));
+    }
+  } catch (e) {}
+  return finalOrder;
 }
 
 async function autoDeliverOrder(order) {
