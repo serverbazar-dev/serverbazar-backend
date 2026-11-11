@@ -4877,8 +4877,19 @@ app.post("/api/admin/stock-items/bulk", protect, isAdmin, async (req, res) => {
         if (r.status === "delivered") filled++;
       }
     }
+    // Jo naye servers pool me gaye, wo total stock ka hi hissa hain,
+// isliye manual count utna kam karo.
+// (filled wale pending orders ka manual count pehle hi kat chuka hai)
+const netNew = added.length - filled;
+if (netNew > 0) {
+  const p = await VpsPlan.findOne({ vpsId, category: cat });
+  if (p && p.manualStockQty > 0) {
+    p.manualStockQty = Math.max(0, p.manualStockQty - netNew);
+    await p.save();
+  }
+}
 
-    if (added.length) await syncPlanStockFromPool(vpsId, cat);
+if (added.length) await syncPlanStockFromPool(vpsId, cat);
 
     res.json({ message: `${added.length} server add hue, ${filled} pending order deliver hue.`, added, skipped, filled });
   } catch (err) {
