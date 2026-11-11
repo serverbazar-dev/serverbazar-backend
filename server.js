@@ -4668,6 +4668,32 @@ const stockItemSchema = new mongoose.Schema(
 stockItemSchema.index({ orderId: 1 }, { unique: true, sparse: true });
 stockItemSchema.index({ vpsId: 1, category: 1, ram: 1, status: 1, createdAt: 1 });
 const StockItem = mongoose.model("StockItem", stockItemSchema);
+async function syncPlanStockFromPool(vpsId, category) {
+  if (!vpsId || String(vpsId).startsWith("manual_")) return;
+  return withPlanLock(`${category}:${vpsId}`, async () => {
+    try {
+      const hasPool = await StockItem.exists({ vpsId, category });
+      if (!hasPool) return;
+
+      const rows = await StockItem.aggregate([
+        { $match: { vpsId, category, status: "available" } },
+        { $group: { _id: "$ram", n: { $sum: 1 } } },
+      ]);
+      const byRam = {};
+      let total = 0;
+      rows.forEach((r) => { byRam[r._id] = r.n; total += r.n; });
+
+      const plan = await VpsPlan.findOne({ vpsId, category });
+      if (!plan) return;
+      plan.stockQty = total;
+      plan.available = total > 0;
+      plan.ramOptions.forEach((o) => { o.available = (byRam[o.ram] || 0) > 0; });
+      await plan.save();
+    } catch (err) {
+      console.error("syncPlanStockFromPool error:", err.message);
+    }
+  });
+}
 
 async function autoDeliverOrder(order) {
   let claimedItem = null;
@@ -4682,7 +4708,10 @@ async function autoDeliverOrder(order) {
         { $set: { status: "sold", orderId: order._id, user: order.user, soldAt: new Date() } },
         { sort: { createdAt: 1 }, new: true }
       );
-      if (!item) return order;
+      if (!item) {
+  await syncPlanStockFromPool(order.vpsId, order.category);
+  return order;
+}
       claimedItem = item;
     }
 
@@ -4718,8 +4747,10 @@ async function autoDeliverOrder(order) {
           { $set: { status: "available" }, $unset: { orderId: 1, user: 1, soldAt: 1 } }
         );
       }
+      await syncPlanStockFromPool(order.vpsId, order.category);
       return order;
     }
+    await syncPlanStockFromPool(updated.vpsId, updated.category);
 
     try {
       const u = await User.findById(updated.user).select("name email");
@@ -4829,14 +4860,7 @@ app.post("/api/admin/stock-items/bulk", protect, isAdmin, async (req, res) => {
       }
     }
 
-    if (added.length) {
-      plan.stockQty = Math.max(0, (plan.stockQty || 0) + added.length - filled);
-      if (plan.stockQty > 0) {
-        plan.available = true;
-        plan.ramOptions.forEach((o) => { if (o.ram === ram) o.available = true; });
-      }
-      await plan.save();
-    }
+    if (added.length) await syncPlanStockFromPool(vpsId, cat);
 
     res.json({ message: `${added.length} server add hue, ${filled} pending order deliver hue.`, added, skipped, filled });
   } catch (err) {
@@ -4868,7 +4892,7 @@ app.delete("/api/admin/stock-items/:id", protect, isAdmin, async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ message: "Invalid id." });
     const item = await StockItem.findOneAndDelete({ _id: req.params.id, status: "available" });
     if (!item) return res.status(404).json({ message: "Item nahi mila ya bik chuka hai." });
-    await VpsPlan.updateOne({ vpsId: item.vpsId, category: item.category, stockQty: { $gt: 0 } }, { $inc: { stockQty: -1 } });
+    await syncPlanStockFromPool(item.vpsId, item.category);
     res.json({ message: "Item hata diya." });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
