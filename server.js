@@ -4890,10 +4890,13 @@ app.get("/api/admin/stock-items", protect, isAdmin, async (req, res) => {
 app.delete("/api/admin/stock-items/:id", protect, isAdmin, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ message: "Invalid id." });
-    const item = await StockItem.findOneAndDelete({ _id: req.params.id, status: "available" });
-    if (!item) return res.status(404).json({ message: "Item nahi mila ya bik chuka hai." });
-    await syncPlanStockFromPool(item.vpsId, item.category);
-    res.json({ message: "Item hata diya." });
+    // available ho ya sold, dono delete ho sakte hain
+    const item = await StockItem.findOneAndDelete({ _id: req.params.id });
+    if (!item) return res.status(404).json({ message: "Item nahi mila." });
+    if (item.status === "available") {
+      await syncPlanStockFromPool(item.vpsId, item.category);
+    }
+    res.json({ message: item.status === "sold" ? "Sold record hata diya." : "Item hata diya." });
   } catch (err) {
     res.status(500).json({ message: "Server error", error: err.message });
   }
