@@ -1951,7 +1951,8 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
 
         logPurchaseActivity({ user: req.userId, category: cat, vpsId: plan.vpsId, nameOrIp: plan.nameOrIp, ram: selectedOption.ram, gateway: "wallet", stage: "create-payment", status: "success", message: "Order confirm ✅", amount: finalAmount });
 
-        return res.status(201).json({ gateway: "wallet", message: "Wallet se payment ho gaya! Order confirm.", order });
+        const finalOrder = await autoDeliverOrder(order);
+        return res.status(201).json({ gateway: "wallet", message: "Wallet se payment ho gaya! Order confirm.", order: finalOrder });
       } catch (err) {
         await session.abortTransaction();
         session.endSession();
@@ -2140,7 +2141,8 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
       console.error("Telegram alert bhejte waqt error:", alertErr.message);
     }
 
-    res.status(201).json({ message: "Payment successful! Order confirm ho gaya.", order });
+    const finalOrder = await autoDeliverOrder(order);
+    res.status(201).json({ message: "Payment successful! Order confirm ho gaya.", order: finalOrder });
   } catch (err) {
     res.status(500).json({ message: "Payment verify karte waqt error", error: err.message });
   }
@@ -2230,7 +2232,8 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
       console.error("Telegram alert bhejte waqt error:", alertErr.message);
     }
 
-    res.status(201).json({ message: "Payment successful! Order confirm ho gaya.", order });
+    const finalOrder = await autoDeliverOrder(order);
+    res.status(201).json({ message: "Payment successful! Order confirm ho gaya.", order: finalOrder });
   } catch (err) {
     res.status(500).json({ message: "Payment verify karte waqt error", error: err.message });
   }
@@ -4538,6 +4541,7 @@ app.post("/api/webhooks/razorpay", async (req, res) => {
       sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
     } catch (e) {}
 
+    await autoDeliverOrder(order);
     res.status(200).json({ message: "Order created via webhook." });
   } catch (err) {
     console.error("Razorpay webhook error:", err.message);
@@ -4633,13 +4637,257 @@ app.post("/api/webhooks/cashfree", async (req, res) => {
       sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
     } catch (e) {}
 
+        await autoDeliverOrder(order);
     res.status(200).json({ message: "Order created via webhook." });
   } catch (err) {
     console.error("Cashfree webhook error:", err.message);
     res.status(500).json({ message: "Webhook processing error." });
   }
 });
+// ==================== AUTO-DELIVERY STOCK (READY SERVERS POOL) ====================
+const stockItemSchema = new mongoose.Schema(
+  {
+    vpsId: { type: String, required: true, index: true },
+    category: { type: String, enum: ["vps", "linux"], default: "vps" },
+    ram: { type: String, required: true },
+    ip: { type: String, required: true, trim: true },
+    port: { type: String, default: "" },
+    username: { type: String, default: "root" },
+    passwordEnc: { type: String, required: true },
+    os: { type: String, default: "" },
+    vmId: { type: Number, default: null },
+    pvVmId: { type: Number, default: null },
+    mxVmId: { type: String, default: null },
+    status: { type: String, enum: ["available", "sold"], default: "available" },
+    orderId: { type: mongoose.Schema.Types.ObjectId, ref: "Order" },
+    user: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    soldAt: { type: Date },
+  },
+  { timestamps: true }
+);
+stockItemSchema.index({ orderId: 1 }, { unique: true, sparse: true });
+stockItemSchema.index({ vpsId: 1, category: 1, ram: 1, status: 1, createdAt: 1 });
+const StockItem = mongoose.model("StockItem", stockItemSchema);
 
+async function autoDeliverOrder(order) {
+  let claimedItem = null;
+  try {
+    if (!order || order.status !== "pending" || order.deliveryIp) return order;
+    if (!order.vpsId || String(order.vpsId).startsWith("manual_")) return order;
+
+    let item = await StockItem.findOne({ orderId: order._id });
+    if (!item) {
+      item = await StockItem.findOneAndUpdate(
+        { vpsId: order.vpsId, category: order.category, ram: order.ram, status: "available" },
+        { $set: { status: "sold", orderId: order._id, user: order.user, soldAt: new Date() } },
+        { sort: { createdAt: 1 }, new: true }
+      );
+      if (!item) return order;
+      claimedItem = item;
+    }
+
+    const plan = await VpsPlan.findOne({ vpsId: order.vpsId, category: order.category }).select("isTrial");
+    const days = plan?.isTrial ? 2 : 30;
+    const now = new Date();
+
+    const upd = {
+      status: "delivered",
+      deliveredAt: now,
+      validityDays: days,
+      expiresAt: new Date(now.getTime() + days * 24 * 60 * 60 * 1000),
+      deliveryIp: item.ip,
+      deliveryPort: item.port,
+      deliveryUsername: item.username,
+      deliveryPassword: decryptSecret(item.passwordEnc),
+      deliveryOS: item.os,
+    };
+    if (item.vmId) upd.vmId = item.vmId;
+    if (item.pvVmId) upd.pvVmId = item.pvVmId;
+    if (item.mxVmId) upd.mxVmId = item.mxVmId;
+
+    const updated = await Order.findOneAndUpdate(
+      { _id: order._id, status: "pending", deliveryIp: { $in: [null, ""] } },
+      { $set: upd },
+      { new: true }
+    );
+
+    if (!updated) {
+      if (claimedItem) {
+        await StockItem.updateOne(
+          { _id: claimedItem._id, orderId: order._id },
+          { $set: { status: "available" }, $unset: { orderId: 1, user: 1, soldAt: 1 } }
+        );
+      }
+      return order;
+    }
+
+    try {
+      const u = await User.findById(updated.user).select("name email");
+      sendTelegramMessage(
+        [
+          `⚡ <b>Auto Delivered</b>`,
+          ``,
+          `👤 ${escapeHtml(u?.name)} (${escapeHtml(u?.email)})`,
+          `🌐 <b>IP:</b> <code>${escapeHtml(item.ip)}</code>`,
+          `📦 ${escapeHtml(updated.nameOrIp)} · ${escapeHtml(updated.ram || "-")}`,
+          `🆔 <code>${escapeHtml(updated._id)}</code>`,
+        ].join("\n")
+      );
+    } catch (e) {}
+
+    return updated;
+  } catch (err) {
+    console.error("autoDeliverOrder error:", err.message);
+    if (claimedItem) {
+      await StockItem.updateOne(
+        { _id: claimedItem._id, orderId: order._id },
+        { $set: { status: "available" }, $unset: { orderId: 1, user: 1, soldAt: 1 } }
+      ).catch(() => {});
+    }
+    return order;
+  }
+}
+
+// ---------- ADMIN: READY STOCK ADD (bulk) ----------
+// Line format: ip|port|username|password|os   (VM provider chuna ho to: ip|port|username|password|os|vmId)
+app.post("/api/admin/stock-items/bulk", protect, isAdmin, async (req, res) => {
+  try {
+    const { vpsId, ram, text, fillPending } = req.body;
+    const cat = req.body.category === "linux" ? "linux" : "vps";
+    const vmProvider = ["hh", "pv", "mx"].includes(req.body.vmProvider) ? req.body.vmProvider : "none";
+
+    if (!vpsId || !ram || typeof text !== "string" || !text.trim()) {
+      return res.status(400).json({ message: "vpsId, ram aur text (servers ki list) zaroori hai." });
+    }
+
+    const plan = await VpsPlan.findOne({ vpsId, category: cat });
+    if (!plan) return res.status(404).json({ message: "Plan nahi mila." });
+    if (!plan.ramOptions.some((o) => o.ram === ram)) {
+      return res.status(400).json({ message: "Ye RAM option is plan me nahi hai." });
+    }
+
+    const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+    if (lines.length > 200) return res.status(400).json({ message: "Ek baar me max 200 servers." });
+
+    const added = [];
+    const skipped = [];
+
+    for (const line of lines) {
+      const [ip, port, username, password, os, vmRef] = line.split("|").map((s) => (s || "").trim());
+      if (!ip || !password) { skipped.push({ line: ip || line, reason: "ip ya password missing" }); continue; }
+
+      // ---- VM ID (agar provider chuna hai) ----
+      const vmFields = {};
+      if (vmProvider !== "none") {
+        if (!vmRef) { skipped.push({ line: ip, reason: "vmId missing (6th column)" }); continue; }
+        if (vmProvider === "mx") {
+          if (!mxValidId(vmRef)) { skipped.push({ line: ip, reason: "MetricsX vmId valid UUID nahi hai" }); continue; }
+          vmFields.mxVmId = vmRef;
+        } else {
+          const n = Number(vmRef);
+          if (!n) { skipped.push({ line: ip, reason: "vmId number hona chahiye" }); continue; }
+          vmFields[vmProvider === "hh" ? "vmId" : "pvVmId"] = n;
+        }
+        const vmInPool = await StockItem.exists({ ...vmFields, status: "available" });
+        const vmInOrders = await Order.exists({
+          ...vmFields,
+          status: { $in: ["delivered", "active"] },
+          expiresAt: { $gt: new Date() },
+        });
+        if (vmInPool || vmInOrders) { skipped.push({ line: ip, reason: "ye VM ID pehle se pool/active order me hai" }); continue; }
+      }
+
+      // ---- duplicate IP check ----
+      const inPool = await StockItem.exists({ ip, status: "available" });
+      const inOrders = await Order.exists({
+        deliveryIp: ip,
+        status: { $in: ["delivered", "active"] },
+        expiresAt: { $gt: new Date() },
+      });
+      if (inPool || inOrders) { skipped.push({ line: ip, reason: "ye IP pehle se pool/active order me hai" }); continue; }
+
+      await StockItem.create({
+        vpsId, category: cat, ram, ip,
+        port: port || "",
+        username: username || "root",
+        passwordEnc: encryptSecret(password),
+        os: os || "",
+        ...vmFields,
+      });
+      added.push(ip);
+    }
+
+    let filled = 0;
+    if (fillPending && added.length) {
+      const pendingOrders = await Order.find({
+        vpsId, category: cat, ram, status: "pending",
+        deliveryIp: { $in: [null, ""] }, paymentStatus: "paid",
+      }).sort({ createdAt: 1 }).limit(added.length);
+      for (const po of pendingOrders) {
+        const r = await autoDeliverOrder(po);
+        if (r.status === "delivered") filled++;
+      }
+    }
+
+    if (added.length) {
+      plan.stockQty = Math.max(0, (plan.stockQty || 0) + added.length - filled);
+      if (plan.stockQty > 0) {
+        plan.available = true;
+        plan.ramOptions.forEach((o) => { if (o.ram === ram) o.available = true; });
+      }
+      await plan.save();
+    }
+
+    res.json({ message: `${added.length} server add hue, ${filled} pending order deliver hue.`, added, skipped, filled });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+app.get("/api/admin/stock-items", protect, isAdmin, async (req, res) => {
+  try {
+    const filter = {};
+    if (req.query.vpsId) filter.vpsId = String(req.query.vpsId);
+    if (req.query.status === "available" || req.query.status === "sold") filter.status = req.query.status;
+    const items = await StockItem.find(filter)
+      .select("-passwordEnc")
+      .populate("user", "name email")
+      .sort({ createdAt: -1 })
+      .limit(500);
+    const summary = await StockItem.aggregate([
+      { $group: { _id: { vpsId: "$vpsId", ram: "$ram", status: "$status" }, count: { $sum: 1 } } },
+    ]);
+    res.json({ items, summary });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+app.delete("/api/admin/stock-items/:id", protect, isAdmin, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ message: "Invalid id." });
+    const item = await StockItem.findOneAndDelete({ _id: req.params.id, status: "available" });
+    if (!item) return res.status(404).json({ message: "Item nahi mila ya bik chuka hai." });
+    await VpsPlan.updateOne({ vpsId: item.vpsId, category: item.category, stockQty: { $gt: 0 } }, { $inc: { stockQty: -1 } });
+    res.json({ message: "Item hata diya." });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+app.post("/api/admin/orders/:id/auto-deliver", protect, isAdmin, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ message: "Invalid id." });
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ message: "Order nahi mila." });
+    const result = await autoDeliverOrder(order);
+    if (result.status !== "delivered") return res.status(400).json({ message: "Is plan+RAM ka ready stock nahi hai ya order pending nahi hai." });
+    res.json({ message: "Order deliver ho gaya.", order: result });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+// ==================== END AUTO-DELIVERY STOCK ====================
 
 // ==================== BASE ROUTE ====================
 
