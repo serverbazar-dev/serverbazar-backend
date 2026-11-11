@@ -738,6 +738,7 @@ panelUsername: { type: String, default: "" },
 panelPasswordEnc: { type: String, default: "" },
 shareTokenHash: { type: String, index: true, sparse: true },
 shareEnabled: { type: Boolean, default: false },
+puttyInfo: { type: String, default: "" },
   },
   { timestamps: true }
 );
@@ -3953,6 +3954,7 @@ app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
     if (deliveryUsername !== undefined) updateFields.deliveryUsername = deliveryUsername;
     if (deliveryPassword !== undefined) updateFields.deliveryPassword = deliveryPassword;
     if (deliveryOS !== undefined) updateFields.deliveryOS = deliveryOS;
+    if (req.body.puttyInfo !== undefined) updateFields.puttyInfo = cleanText(req.body.puttyInfo, 300);
 
     if (status === "delivered") {
       const days = Number(validityDays) > 0 ? Number(validityDays) : 30;
