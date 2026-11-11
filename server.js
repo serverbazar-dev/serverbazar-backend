@@ -764,6 +764,7 @@ const vpsPlanSchema = new mongoose.Schema(
     ],
     available: { type: Boolean, default: true },
     stockQty: { type: Number, default: null }, // ✅ NAYA — pura plan ka shared stock pool (null = unlimited)
+        manualStockQty: { type: Number, default: 0 }, // pool ke bahar, manual delivery ke liye stock
     bestSeller: { type: Boolean, default: false }, // admin manually marks this as "Most Demanded"
     pinnedPosition: { type: Boolean, default: false }, // true = out-of-stock hone par bhi neeche mat bhejo, jahan set kiya hai wahi dikhao
     category: { type: String, enum: ["vps", "linux"], default: "vps" }, // "vps" ya "linux"
@@ -1309,6 +1310,10 @@ async function finalizeRenewal(pending, { gateway, razorpayPaymentId, cfPaymentI
 
 async function decrementRamStock(vpsId, category, ram) {
   try {
+    // Pool wale plans ka stock syncPlanStockFromPool sambhalta hai, yahan mat chhedo
+    const hasPool = await StockItem.exists({ vpsId, category });
+    if (hasPool) return;
+
     const plan = await VpsPlan.findOne({ vpsId, category });
     if (!plan || plan.stockQty == null) return; // unlimited — skip
 
@@ -4120,19 +4125,25 @@ app.put("/api/admin/vps-plans/:id", protect, isAdmin, async (req, res) => {
       plan.available = available;
 
       if (available === true) {
-        // ✅ NAYA — ek hi shared stock pool poore plan ke liye, chahe koi bhi RAM bike
         if (stockQty !== undefined && stockQty !== null) {
           const num = Number(stockQty);
           plan.stockQty = num > 0 ? num : null;
+          // pool me jitne available server hain, unko total me se ghatao, bacha hua = manual stock
+          const poolAvail = await StockItem.countDocuments({
+            vpsId: plan.vpsId, category: plan.category, status: "available",
+          });
+          plan.manualStockQty = num > 0 ? Math.max(0, num - poolAvail) : 0;
         }
         plan.ramOptions.forEach((o) => { o.available = true; });
       } else {
         plan.stockQty = 0;
+        plan.manualStockQty = 0;
         plan.ramOptions.forEach((o) => { o.available = false; });
       }
     }
 
     await plan.save();
+        if (available === true) await syncPlanStockFromPool(plan.vpsId, plan.category);
 
     res.json({ message: "Plan update ho gaya.", plan });
   } catch (err) {
@@ -4654,14 +4665,21 @@ async function syncPlanStockFromPool(vpsId, category) {
         { $group: { _id: "$ram", n: { $sum: 1 } } },
       ]);
       const byRam = {};
-      let total = 0;
-      rows.forEach((r) => { byRam[r._id] = r.n; total += r.n; });
+      let poolTotal = 0;
+      rows.forEach((r) => { byRam[r._id] = r.n; poolTotal += r.n; });
 
       const plan = await VpsPlan.findOne({ vpsId, category });
       if (!plan) return;
+
+      const manual = Math.max(0, Number(plan.manualStockQty) || 0);
+      const total = poolTotal + manual;
+
       plan.stockQty = total;
       plan.available = total > 0;
-      plan.ramOptions.forEach((o) => { o.available = (byRam[o.ram] || 0) > 0; });
+      // manual stock bacha hai to saare RAM chalu, warna sirf wahi RAM jiska pool me server hai
+      plan.ramOptions.forEach((o) => {
+        o.available = manual > 0 ? true : (byRam[o.ram] || 0) > 0;
+      });
       await plan.save();
     } catch (err) {
       console.error("syncPlanStockFromPool error:", err.message);
@@ -4675,6 +4693,14 @@ async function deliverAndAlert(order) {
   const finalOrder = await autoDeliverOrder(order);
   try {
     if (!(finalOrder && finalOrder.status === "delivered")) {
+      // pool me server nahi mila, yaani ye order manual se dena hai:
+      // manual stock me se ek ghatao
+      await VpsPlan.updateOne(
+        { vpsId: order.vpsId, category: order.category, manualStockQty: { $gt: 0 } },
+        { $inc: { manualStockQty: -1 } }
+      );
+      await syncPlanStockFromPool(order.vpsId, order.category);
+
       const u = await User.findById(order.user).select("name email");
       sendTelegramMessage(buildOrderAlertMessage({ user: u, order: finalOrder || order }));
     }
