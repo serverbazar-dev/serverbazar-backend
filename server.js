@@ -1951,8 +1951,7 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
 
         logPurchaseActivity({ user: req.userId, category: cat, vpsId: plan.vpsId, nameOrIp: plan.nameOrIp, ram: selectedOption.ram, gateway: "wallet", stage: "create-payment", status: "success", message: "Order confirm ✅", amount: finalAmount });
 
-        const finalOrder = await autoDeliverOrder(order);
-        return res.status(201).json({ gateway: "wallet", message: "Wallet se payment ho gaya! Order confirm.", order: finalOrder });
+        return res.status(201).json({ gateway: "wallet", message: "Wallet se payment ho gaya! Order confirm.", order });
       } catch (err) {
         await session.abortTransaction();
         session.endSession();
@@ -2141,8 +2140,7 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
       console.error("Telegram alert bhejte waqt error:", alertErr.message);
     }
 
-    const finalOrder = await autoDeliverOrder(order);
-    res.status(201).json({ message: "Payment successful! Order confirm ho gaya.", order: finalOrder });
+    res.status(201).json({ message: "Payment successful! Order confirm ho gaya.", order });
   } catch (err) {
     res.status(500).json({ message: "Payment verify karte waqt error", error: err.message });
   }
@@ -2232,8 +2230,7 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
       console.error("Telegram alert bhejte waqt error:", alertErr.message);
     }
 
-    const finalOrder = await autoDeliverOrder(order);
-    res.status(201).json({ message: "Payment successful! Order confirm ho gaya.", order: finalOrder });
+    res.status(201).json({ message: "Payment successful! Order confirm ho gaya.", order });
   } catch (err) {
     res.status(500).json({ message: "Payment verify karte waqt error", error: err.message });
   }
@@ -2525,13 +2522,6 @@ app.post("/api/admin/orders/manual-create", protect, isAdmin, async (req, res) =
     if (!targetUser) {
       return res.status(404).json({ message: "Is email ka user nahi mila." });
     }
-        const dupManual = await findDuplicateDelivery({
-      ip: String(deliveryIp).trim(),
-      vmId, pvVmId: req.body.pvVmId, mxVmId: req.body.mxVmId,
-    });
-    if (dupManual) {
-      return res.status(409).json({ message: `Ye IP/VM pehle se ${dupManual.user?.email || "kisi user"} ke active order me hai.` });
-    }
 
     const numPrice = Number(price) || 0;
     const cat = category === "linux" ? "linux" : "vps";
@@ -2611,8 +2601,7 @@ app.get("/api/admin/users/search", protect, isAdmin, async (req, res) => {
   try {
     const q = (req.query.email || "").trim();
     if (!q) return res.json([]);
-    const safeQ = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-const users = await User.find({ email: { $regex: safeQ, $options: "i" } })
+    const users = await User.find({ email: { $regex: q, $options: "i" } })
       .select("name email phone role")
       .limit(8);
     res.json(users);
@@ -3974,22 +3963,6 @@ app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
       updateFields.validityDays = days;
       updateFields.expiresAt = new Date(deliveredAt.getTime() + days * 24 * 60 * 60 * 1000);
     }
-        if (status !== undefined && !["pending", "active", "delivered", "cancelled"].includes(status)) {
-      return res.status(400).json({ message: "Invalid status." });
-    }
-    if (status === "delivered" || deliveryIp !== undefined) {
-      const ipToCheck = deliveryIp !== undefined ? String(deliveryIp).trim() : existingOrder.deliveryIp;
-      const dup = await findDuplicateDelivery({
-        ip: ipToCheck,
-        vmId: updateFields.vmId, pvVmId: updateFields.pvVmId, mxVmId: updateFields.mxVmId,
-        excludeOrderId: existingOrder._id,
-      });
-      if (dup) {
-        return res.status(409).json({
-          message: `Ye IP/VM pehle se ${dup.user?.email || "kisi user"} ke active order me hai. Deliver nahi ho sakta.`,
-        });
-      }
-    }
 
     const order = await Order.findByIdAndUpdate(
       req.params.id,
@@ -4565,7 +4538,6 @@ app.post("/api/webhooks/razorpay", async (req, res) => {
       sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
     } catch (e) {}
 
-    await autoDeliverOrder(order);
     res.status(200).json({ message: "Order created via webhook." });
   } catch (err) {
     console.error("Razorpay webhook error:", err.message);
@@ -4661,356 +4633,13 @@ app.post("/api/webhooks/cashfree", async (req, res) => {
       sendTelegramMessage(buildOrderAlertMessage({ user: orderedByUser, order }));
     } catch (e) {}
 
-    await autoDeliverOrder(order);
     res.status(200).json({ message: "Order created via webhook." });
   } catch (err) {
     console.error("Cashfree webhook error:", err.message);
     res.status(500).json({ message: "Webhook processing error." });
   }
 });
-// ==================== AUTO-DELIVERY STOCK (READY SERVERS POOL) ====================
-const stockItemSchema = new mongoose.Schema(
-  {
-    vpsId: { type: String, required: true, index: true },
-    category: { type: String, enum: ["vps", "linux"], default: "vps" },
-    ram: { type: String, required: true },
-    ip: { type: String, required: true, trim: true },
-    port: { type: String, default: "" },
-    username: { type: String, default: "root" },
-    passwordEnc: { type: String, required: true },
-    os: { type: String, default: "" },
-    puttyInfo: { type: String, default: "" },
-    vmId: { type: Number, default: null },
-    pvVmId: { type: Number, default: null },
-    mxVmId: { type: String, default: null },
-    status: { type: String, enum: ["available", "sold", "blocked"], default: "available" },
-    orderId: { type: mongoose.Schema.Types.ObjectId, ref: "Order" },
-    user: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
-    soldAt: { type: Date },
-  },
-  { timestamps: true }
-);
-stockItemSchema.index({ orderId: 1 }, { unique: true, sparse: true });
-stockItemSchema.index({ vpsId: 1, category: 1, ram: 1, status: 1, createdAt: 1 });
-// Duplicate ko DB level par roko
-stockItemSchema.index({ ip: 1 }, { unique: true, partialFilterExpression: { status: "available" } });
-stockItemSchema.index({ vmId: 1 }, { unique: true, partialFilterExpression: { status: "available", vmId: { $type: "number" } } });
-stockItemSchema.index({ pvVmId: 1 }, { unique: true, partialFilterExpression: { status: "available", pvVmId: { $type: "number" } } });
-stockItemSchema.index({ mxVmId: 1 }, { unique: true, partialFilterExpression: { status: "available", mxVmId: { $type: "string" } } });
-const StockItem = mongoose.model("StockItem", stockItemSchema);
 
-// ---------- Duplicate delivery checker ----------
-async function findDuplicateDelivery({ ip, vmId, pvVmId, mxVmId, excludeOrderId }) {
-  const or = [];
-  if (ip) or.push({ deliveryIp: String(ip).trim() });
-  if (vmId) or.push({ vmId: Number(vmId) });
-  if (pvVmId) or.push({ pvVmId: Number(pvVmId) });
-  if (mxVmId) or.push({ mxVmId: String(mxVmId) });
-  if (!or.length) return null;
-
-  const filter = {
-    $or: or,
-    status: { $in: ["delivered", "active"] },
-    $and: [{ $or: [{ expiresAt: { $gt: new Date() } }, { expiresAt: null }] }],
-  };
-  if (excludeOrderId && mongoose.Types.ObjectId.isValid(excludeOrderId)) {
-    filter._id = { $ne: excludeOrderId };
-  }
-  return Order.findOne(filter).select("nameOrIp deliveryIp user").populate("user", "name email");
-}
-
-const IPV4_RE = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
-
-function parseStockLine(line, cat) {
-  // Linux me PuTTY format bhi chalega: ip:port:user:password
-  if (cat === "linux" && !line.includes("|")) {
-    const p = line.split(":");
-    if (p.length >= 4) {
-      return {
-        ip: p[0].trim(), port: p[1].trim(), username: p[2].trim(),
-        password: p.slice(3).join(":").trim(), os: "", vmRef: "", puttyInfo: line.trim(),
-      };
-    }
-  }
-  const [ip, port, username, password, os, vmRef] = line.split("|").map((s) => (s || "").trim());
-  return {
-    ip, port, username, password, os, vmRef,
-    puttyInfo: cat === "linux" && ip && password ? `${ip}:${port || "22"}:${username || "root"}:${password}` : "",
-  };
-}
-
-async function autoDeliverOrder(order) {
-  let claimedItem = null;
-  try {
-    if (!order || order.status !== "pending" || order.deliveryIp) return order;
-    if (order.paymentStatus !== "paid") return order;
-    if (!order.vpsId || String(order.vpsId).startsWith("manual_")) return order;
-
-    let item = await StockItem.findOne({ orderId: order._id });
-    if (!item) {
-      for (let i = 0; i < 5 && !item; i++) {
-        const cand = await StockItem.findOneAndUpdate(
-          { vpsId: order.vpsId, category: order.category, ram: order.ram, status: "available" },
-          { $set: { status: "sold", orderId: order._id, user: order.user, soldAt: new Date() } },
-          { sort: { createdAt: 1 }, new: true }
-        );
-        if (!cand) return order; // stock nahi hai, order pending rahega
-
-        const dup = await findDuplicateDelivery({
-          ip: cand.ip, vmId: cand.vmId, pvVmId: cand.pvVmId, mxVmId: cand.mxVmId, excludeOrderId: order._id,
-        });
-        if (dup) {
-          await StockItem.updateOne(
-            { _id: cand._id },
-            { $set: { status: "blocked" }, $unset: { orderId: 1, user: 1, soldAt: 1 } }
-          );
-          sendTelegramMessage(`🚫 <b>Duplicate IP roka gaya</b>\n🌐 <code>${escapeHtml(cand.ip)}</code> pehle se active order me hai. Stock item block kar diya.`);
-          continue;
-        }
-        item = cand;
-        claimedItem = cand;
-      }
-      if (!item) return order;
-    }
-
-    const plan = await VpsPlan.findOne({ vpsId: order.vpsId, category: order.category }).select("isTrial");
-    const days = plan?.isTrial ? 2 : 30;
-    const now = new Date();
-    const plainPassword = decryptSecret(item.passwordEnc);
-
-    const upd = {
-      status: "delivered",
-      deliveredAt: now,
-      validityDays: days,
-      expiresAt: new Date(now.getTime() + days * 24 * 60 * 60 * 1000),
-      deliveryIp: item.ip,
-      deliveryPort: item.port,
-      deliveryUsername: item.username,
-      deliveryPassword: plainPassword,
-      deliveryOS: item.os,
-    };
-    if (order.category === "linux") {
-      upd.puttyInfo = item.puttyInfo || `${item.ip}:${item.port || "22"}:${item.username}:${plainPassword}`;
-    }
-    if (item.vmId) upd.vmId = item.vmId;
-    if (item.pvVmId) upd.pvVmId = item.pvVmId;
-    if (item.mxVmId) upd.mxVmId = item.mxVmId;
-
-    const updated = await Order.findOneAndUpdate(
-      { _id: order._id, status: "pending", deliveryIp: { $in: [null, ""] } },
-      { $set: upd },
-      { new: true }
-    );
-
-    if (!updated) {
-      if (claimedItem) {
-        await StockItem.updateOne(
-          { _id: claimedItem._id, orderId: order._id },
-          { $set: { status: "available" }, $unset: { orderId: 1, user: 1, soldAt: 1 } }
-        );
-      }
-      return order;
-    }
-
-    try {
-      const u = await User.findById(updated.user).select("name email");
-      sendTelegramMessage(
-        [
-          `⚡ <b>Auto Delivered</b>`,
-          ``,
-          `👤 ${escapeHtml(u?.name)} (${escapeHtml(u?.email)})`,
-          `🌐 <b>IP:</b> <code>${escapeHtml(item.ip)}</code>`,
-          `📦 ${escapeHtml(updated.nameOrIp)} · ${escapeHtml(updated.ram || "-")}`,
-          `🆔 <code>${escapeHtml(updated._id)}</code>`,
-        ].join("\n")
-      );
-    } catch (e) {}
-
-    return updated;
-  } catch (err) {
-    console.error("autoDeliverOrder error:", err.message);
-    if (claimedItem) {
-      await StockItem.updateOne(
-        { _id: claimedItem._id, orderId: order._id },
-        { $set: { status: "available" }, $unset: { orderId: 1, user: 1, soldAt: 1 } }
-      ).catch(() => {});
-    }
-    return order;
-  }
-}
-
-// ---------- ADMIN: READY STOCK ADD (bulk) ----------
-// Line format: ip|port|username|password|os   (VM provider chuna ho to: ip|port|username|password|os|vmId)
-app.post("/api/admin/stock-items/bulk", protect, isAdmin, async (req, res) => {
-  try {
-    const { vpsId, ram, text, fillPending } = req.body;
-    const cat = req.body.category === "linux" ? "linux" : "vps";
-    const vmProvider = ["hh", "pv", "mx"].includes(req.body.vmProvider) ? req.body.vmProvider : "none";
-
-    if (typeof vpsId !== "string" || typeof ram !== "string" || typeof text !== "string" || !text.trim()) {
-      return res.status(400).json({ message: "vpsId, ram aur text (servers ki list) zaroori hai." });
-    }
-
-    const plan = await VpsPlan.findOne({ vpsId, category: cat });
-    if (!plan) return res.status(404).json({ message: "Plan nahi mila." });
-    if (!plan.ramOptions.some((o) => o.ram === ram)) {
-      return res.status(400).json({ message: "Ye RAM option is plan me nahi hai." });
-    }
-
-    const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
-    if (lines.length > 200) return res.status(400).json({ message: "Ek baar me max 200 servers." });
-
-    const added = [];
-    const skipped = [];
-
-    for (const line of lines) {
-      const { ip, port, username, password, os, vmRef, puttyInfo } = parseStockLine(line, cat);
-      if (!ip || !password) { skipped.push({ line: ip || line, reason: "ip ya password missing" }); continue; }
-      if (!IPV4_RE.test(ip)) { skipped.push({ line: ip, reason: "IP format galat hai" }); continue; }
-
-      const vmFields = {};
-      if (vmProvider !== "none") {
-        if (!vmRef) { skipped.push({ line: ip, reason: "vmId missing (6th column)" }); continue; }
-        if (vmProvider === "mx") {
-          if (!mxValidId(vmRef)) { skipped.push({ line: ip, reason: "MetricsX vmId valid UUID nahi hai" }); continue; }
-          vmFields.mxVmId = vmRef;
-        } else {
-          const n = Number(vmRef);
-          if (!Number.isInteger(n) || n <= 0) { skipped.push({ line: ip, reason: "vmId number hona chahiye" }); continue; }
-          vmFields[vmProvider === "hh" ? "vmId" : "pvVmId"] = n;
-        }
-      }
-
-      const inPool = await StockItem.exists({
-        status: "available",
-        $or: [{ ip }, ...Object.entries(vmFields).map(([k, v]) => ({ [k]: v }))],
-      });
-      if (inPool) { skipped.push({ line: ip, reason: "ye IP/VM ID pehle se stock pool me hai" }); continue; }
-
-      const dup = await findDuplicateDelivery({ ip, ...vmFields });
-      if (dup) { skipped.push({ line: ip, reason: `active order me hai (${dup.user?.email || "user"})` }); continue; }
-
-      try {
-        await StockItem.create({
-          vpsId, category: cat, ram, ip,
-          port: port || "",
-          username: username || "root",
-          passwordEnc: encryptSecret(password),
-          os: os || "",
-          puttyInfo,
-          ...vmFields,
-        });
-        added.push(ip);
-      } catch (e) {
-        skipped.push({ line: ip, reason: e.code === 11000 ? "duplicate (DB ne roka)" : "save nahi hua" });
-      }
-    }
-
-    let filled = 0;
-    const delivered = [];
-    if (fillPending && added.length) {
-      const pendingOrders = await Order.find({
-        vpsId, category: cat, ram, status: "pending",
-        deliveryIp: { $in: [null, ""] }, paymentStatus: "paid",
-      }).sort({ createdAt: 1 }).limit(added.length);
-
-      for (const po of pendingOrders) {
-        const r = await autoDeliverOrder(po);
-        if (r.status === "delivered") {
-          filled++;
-          const u = await User.findById(po.user).select("name email");
-          delivered.push({ name: u?.name || "-", email: u?.email || "-", ip: r.deliveryIp, orderId: String(r._id) });
-        }
-      }
-    }
-
-    if (added.length) {
-      plan.stockQty = Math.max(0, (plan.stockQty || 0) + added.length - filled);
-      if (plan.stockQty > 0) {
-        plan.available = true;
-        plan.ramOptions.forEach((o) => { if (o.ram === ram) o.available = true; });
-      }
-      await plan.save();
-    }
-
-    res.json({
-      message: `${added.length} server add hue, ${filled} pending order deliver hue.`,
-      added, skipped, filled, delivered,
-    });
-  } catch (err) {
-    res.status(500).json({ message: "Server error", error: err.message });
-  }
-});
-
-app.get("/api/admin/stock-items", protect, isAdmin, async (req, res) => {
-  try {
-    const filter = {};
-    if (req.query.vpsId) filter.vpsId = String(req.query.vpsId);
-    if (["available", "sold", "blocked"].includes(req.query.status)) filter.status = req.query.status;
-    const items = await StockItem.find(filter)
-      .select("-passwordEnc")
-      .populate("user", "name email")
-      .sort({ createdAt: -1 })
-      .limit(500);
-    const summary = await StockItem.aggregate([
-      { $group: { _id: { vpsId: "$vpsId", ram: "$ram", status: "$status" }, count: { $sum: 1 } } },
-    ]);
-    const pending = await Order.aggregate([
-      { $match: { status: "pending", paymentStatus: "paid", deliveryIp: { $in: [null, ""] }, vpsId: { $not: /^manual_/ } } },
-      { $group: { _id: { vpsId: "$vpsId", ram: "$ram" }, count: { $sum: 1 } } },
-    ]);
-    res.json({ items, summary, pending });
-  } catch (err) {
-    res.status(500).json({ message: "Server error", error: err.message });
-  }
-});
-
-// Find VM list me "pehle se used" dikhane ke liye
-app.get("/api/admin/stock-items/used-refs", protect, isAdmin, async (req, res) => {
-  try {
-    const [pool, orders] = await Promise.all([
-      StockItem.find({ status: "available" }).select("ip vmId pvVmId mxVmId").lean(),
-      Order.find({ status: { $in: ["delivered", "active"] }, $or: [{ expiresAt: { $gt: new Date() } }, { expiresAt: null }] })
-        .select("deliveryIp vmId pvVmId mxVmId").lean(),
-    ]);
-    const out = { ips: new Set(), hh: new Set(), pv: new Set(), mx: new Set() };
-    [...pool.map((x) => ({ ...x, deliveryIp: x.ip })), ...orders].forEach((x) => {
-      if (x.deliveryIp) out.ips.add(x.deliveryIp);
-      if (x.vmId) out.hh.add(String(x.vmId));
-      if (x.pvVmId) out.pv.add(String(x.pvVmId));
-      if (x.mxVmId) out.mx.add(String(x.mxVmId));
-    });
-    res.json({ ips: [...out.ips], hh: [...out.hh], pv: [...out.pv], mx: [...out.mx] });
-  } catch (err) {
-    res.status(500).json({ message: "Server error", error: err.message });
-  }
-});
-
-app.delete("/api/admin/stock-items/:id", protect, isAdmin, async (req, res) => {
-  try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ message: "Invalid id." });
-    const item = await StockItem.findOneAndDelete({ _id: req.params.id, status: "available" });
-    if (!item) return res.status(404).json({ message: "Item nahi mila ya bik chuka hai." });
-    await VpsPlan.updateOne({ vpsId: item.vpsId, category: item.category, stockQty: { $gt: 0 } }, { $inc: { stockQty: -1 } });
-    res.json({ message: "Item hata diya." });
-  } catch (err) {
-    res.status(500).json({ message: "Server error", error: err.message });
-  }
-});
-
-app.post("/api/admin/orders/:id/auto-deliver", protect, isAdmin, async (req, res) => {
-  try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ message: "Invalid id." });
-    const order = await Order.findById(req.params.id);
-    if (!order) return res.status(404).json({ message: "Order nahi mila." });
-    const result = await autoDeliverOrder(order);
-    if (result.status !== "delivered") return res.status(400).json({ message: "Is plan+RAM ka ready stock nahi hai ya order pending nahi hai." });
-    res.json({ message: "Order deliver ho gaya.", order: result });
-  } catch (err) {
-    res.status(500).json({ message: "Server error", error: err.message });
-  }
-});
-// ==================== END AUTO-DELIVERY STOCK ====================
 
 // ==================== BASE ROUTE ====================
 
