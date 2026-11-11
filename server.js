@@ -655,8 +655,11 @@ function buildOrderAlertMessage({ user, order, isManual = false }) {
 
   lines.push(`✅ <b>Final Paid:</b> ₹${order.finalAmount}`);
   lines.push(``);
-  const gatewayLabel = order.paymentGateway === "cashfree" ? "Cashfree" : "Razorpay";
-  const paymentId = order.paymentGateway === "cashfree" ? order.cfPaymentId : order.razorpayPaymentId;
+  const gatewayLabels = { cashfree: "Cashfree", razorpay: "Razorpay", wallet: "Wallet", manual: "Manual" };
+  const gatewayLabel = gatewayLabels[order.paymentGateway] || "Razorpay";
+  const paymentId =
+    order.paymentGateway === "cashfree" ? order.cfPaymentId :
+    order.paymentGateway === "razorpay" ? order.razorpayPaymentId : "";
   lines.push(`💳 <b>Gateway:</b> ${gatewayLabel}`);
   lines.push(`🧾 <b>Payment ID:</b> <code>${escapeHtml(paymentId || "-")}</code>`);
   lines.push(`🆔 <b>Order ID:</b> <code>${escapeHtml(order._id)}</code>`);
@@ -4754,16 +4757,21 @@ async function autoDeliverOrder(order) {
 
     try {
       const u = await User.findById(updated.user).select("name email");
-      sendTelegramMessage(
+      const msg =
+        buildOrderAlertMessage({ user: u, order: updated }).replace(
+          "🛒 <b>Naya Order Mila!</b>",
+          "⚡ <b>Auto Delivered Order</b>"
+        ) +
         [
-          `⚡ <b>Auto Delivered</b>`,
           ``,
-          `👤 ${escapeHtml(u?.name)} (${escapeHtml(u?.email)})`,
-          `🌐 <b>IP:</b> <code>${escapeHtml(item.ip)}</code>`,
-          `📦 ${escapeHtml(updated.nameOrIp)} · ${escapeHtml(updated.ram || "-")}`,
-          `🆔 <code>${escapeHtml(updated._id)}</code>`,
-        ].join("\n")
-      );
+          ``,
+          `🌐 <b>Server IP:</b> <code>${escapeHtml(item.ip)}</code>`,
+          `🔌 <b>Port:</b> <code>${escapeHtml(item.port || "-")}</code>`,
+          `👤 <b>Username:</b> <code>${escapeHtml(item.username || "root")}</code>`,
+          `💿 <b>OS:</b> ${escapeHtml(item.os || "-")}`,
+          `⏳ <b>Validity:</b> ${days} din`,
+        ].join("\n");
+      sendTelegramMessage(msg);
     } catch (e) {}
 
     return updated;
