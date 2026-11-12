@@ -450,10 +450,6 @@ async function seedAdmin() {
 }
 
 // ==================== TELEGRAM ORDER ALERTS ====================
-// .env me daalo:
-//   TELEGRAM_BOT_TOKEN=              (BotFather se milega)
-//   TELEGRAM_ADMIN_CHAT_ID=id1,id2   (ek ya zyada admin chat ids, comma se separate)
-// Dono set na ho to alert silently skip ho jaata hai — baaki app normally chalta rahega.
 
 function escapeHtml(value) {
   return String(value ?? "")
