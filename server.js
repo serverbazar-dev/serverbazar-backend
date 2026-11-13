@@ -3848,6 +3848,52 @@ app.get("/api/admin/user-activity", protect, isAdmin, async (req, res) => {
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
+// ---------- ADMIN: TOP BUYERS (sirf active, non-expired, non-trial) ----------
+app.get("/api/admin/top-buyers", protect, isAdmin, async (req, res) => {
+  try {
+    // Trial plans ke vpsId nikalo, inko count nahi karna
+    const trialIds = await VpsPlan.find({ isTrial: true }).distinct("vpsId");
+
+    const rows = await Order.aggregate([
+      {
+        $match: {
+          status: { $in: ["delivered", "active"] },
+          expiresAt: { $gt: new Date() },        // expire wale nahi
+          vpsId: { $nin: trialIds },             // trial wale nahi
+          user: { $ne: null },
+        },
+      },
+      {
+        $group: {
+          _id: "$user",
+          vpsCount: { $sum: { $cond: [{ $eq: ["$category", "vps"] }, 1, 0] } },
+          linuxCount: { $sum: { $cond: [{ $eq: ["$category", "linux"] }, 1, 0] } },
+          total: { $sum: 1 },
+        },
+      },
+      { $sort: { total: -1 } },
+      { $limit: 50 },
+      { $lookup: { from: "users", localField: "_id", foreignField: "_id", as: "u" } },
+      { $unwind: "$u" },
+      {
+        $project: {
+          _id: 0,
+          userId: "$_id",
+          name: "$u.name",
+          email: "$u.email",
+          phone: "$u.phone",
+          vpsCount: 1,
+          linuxCount: 1,
+          total: 1,
+        },
+      },
+    ]);
+
+    res.json({ rows });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
 // ---------- ADMIN: USER KA ROLE CHANGE KARO (sirf user / seller — admin is route se KABHI nahi ban sakta) ----------
 app.put("/api/admin/users/:id/role", protect, isAdmin, async (req, res) => {
   try {
