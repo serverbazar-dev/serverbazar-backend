@@ -684,6 +684,10 @@ function buildOrderAlertMessage({ user, order, isManual = false }) {
   }
 
   lines.push(`✅ <b>Final Paid:</b> ₹${order.finalAmount}`);
+    if (order.walletUsed > 0) {
+    lines.push(`💰 <b>Wallet se kata:</b> ₹${order.walletUsed}`);
+    lines.push(`💳 <b>Gateway/QR se aaya:</b> ₹${order.finalAmount - order.walletUsed}`);
+  }
   lines.push(``);
   const gatewayLabels = { cashfree: "Cashfree", razorpay: "Razorpay", wallet: "Wallet", manual: "Manual" };
   const gatewayLabel = gatewayLabels[order.paymentGateway] || "Razorpay";
@@ -739,6 +743,7 @@ const orderSchema = new mongoose.Schema(
     couponCode: { type: String },
     discountAmount: { type: Number, default: 0 },
     finalAmount: { type: Number }, // price - discountAmount (jo actually charge hua)
+        walletUsed: { type: Number, default: 0 },
     status: { type: String, default: "pending" }, // pending | active | delivered | cancelled
     // ---- payment info ----
     razorpayOrderId: { type: String },
@@ -853,6 +858,7 @@ renewOrderId: { type: mongoose.Schema.Types.ObjectId, ref: "Order" },
     couponCode: { type: String },
     discountAmount: { type: Number, default: 0 },
     finalAmount: { type: Number, required: true }, // jo actually charge hua (Razorpay amount)
+        walletUsed: { type: Number, default: 0 },
     createdAt: { type: Date, default: Date.now, expires: 900 }, // 900s = 15 min TTL
   }
 );
@@ -1337,6 +1343,55 @@ async function finalizeRenewal(pending, { gateway, razorpayPaymentId, cfPaymentI
   });
   return renewal;
 }
+// ==================== PARTIAL WALLET HELPERS ====================
+// Gateway se asli payment aane ke BAAD wallet ka hissa atomically katta hai.
+// Wallet me paise kam nikle to gateway wala paisa wallet me refund ho jata hai.
+async function chargeWalletPortion(pending) {
+  const w = Number(pending.walletUsed) || 0;
+  if (w <= 0) return true;
+
+  const charged = await Wallet.findOneAndUpdate(
+    { user: pending.user, balance: { $gte: w } },
+    { $inc: { balance: -w } },
+    { new: true }
+  );
+  if (charged) return true;
+
+  const paid = pending.finalAmount - w;
+  await Wallet.findOneAndUpdate(
+    { user: pending.user },
+    { $inc: { balance: paid } },
+    { upsert: true }
+  );
+  await WalletTransaction.create({
+    user: pending.user,
+    type: "refund",
+    amount: paid,
+    description: "Refund: wallet balance kam pad gaya, partial payment cancel",
+    status: "completed",
+  });
+  try {
+    const u = await User.findById(pending.user).select("name email");
+    sendTelegramMessage(
+      `⚠️ <b>Partial Wallet Payment Fail</b>\n\n👤 ${escapeHtml(u?.name)} (${escapeHtml(u?.email)})\n💳 Gateway se aaya ₹${paid} wallet me refund kar diya.\nWallet portion ₹${w} (balance kam tha). Order nahi bana.`
+    );
+  } catch (e) {}
+  return false;
+}
+
+// Order ban jane ke baad wallet debit ki transaction history save karta hai
+async function recordWalletPortion(order) {
+  if (!order || !(order.walletUsed > 0)) return;
+  await WalletTransaction.create({
+    user: order.user,
+    type: "debit",
+    amount: order.walletUsed,
+    description: `Purchase (partial wallet): ${order.nameOrIp || order.planName}`,
+    orderId: order._id,
+    status: "completed",
+  });
+}
+// ==================== END PARTIAL WALLET HELPERS ====================
 
 async function decrementRamStock(vpsId, category, ram) {
   try {
@@ -1993,6 +2048,14 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
         return res.status(500).json({ message: "Wallet payment fail ho gaya.", error: err.message });
       }
     }
+        // ---- Partial wallet: wallet ka hissa + baaki gateway se ----
+    let walletUsed = 0;
+    if (req.body.useWallet === true && selectedGateway !== "wallet") {
+      const w = await Wallet.findOne({ user: req.userId });
+      const bal = w ? w.balance : 0;
+      walletUsed = Math.max(0, Math.floor(Math.min(bal, finalAmount - 1)));
+    }
+    const payAmount = finalAmount - walletUsed; // gateway se itna hi lena hai
 
     if (selectedGateway === "cashfree") {
       
@@ -2000,7 +2063,7 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
 
       const cfOrder = await cashfreeClient.PGCreateOrder({
         order_id: cfOrderId,
-        order_amount: finalAmount,
+                order_amount: payAmount,
         order_currency: "INR",
         customer_details: {
           customer_id: String(req.userId),
@@ -2023,6 +2086,7 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
         couponCode: appliedCouponCode,
         discountAmount,
         finalAmount,
+                walletUsed,
       });
 
       return res.json({
@@ -2032,10 +2096,12 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
         paymentSessionId: cfOrder.data.payment_session_id,
         discountAmount,
         finalAmount,
+        walletUsed,
+        payAmount,
       });
     }
 
-    const amountInPaise = finalAmount * 100;
+    const amountInPaise = payAmount * 100;
 
     const razorpayOrder = await razorpay.orders.create({
       amount: amountInPaise,
@@ -2056,6 +2122,7 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
       couponCode: appliedCouponCode,
       discountAmount,
       finalAmount,
+            walletUsed,
     });
 
     res.json({
@@ -2066,6 +2133,8 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
       keyId: process.env.RAZORPAY_KEY_ID,
       discountAmount,
       finalAmount,
+            walletUsed,
+      payAmount,
     });
   } catch (err) {
     res.status(500).json({ message: "Payment order banane me error", error: err.message });
@@ -2121,7 +2190,7 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
       return res.status(400).json({ message: "Payment kisi aur order ka hai." });
     }
 
-    const expectedAmountInPaise = Math.round(pending.finalAmount * 100);
+        const expectedAmountInPaise = Math.round((pending.finalAmount - (pending.walletUsed || 0)) * 100);
     if (razorpayPaymentDetails.amount !== expectedAmountInPaise) {
       return res.status(400).json({ message: "Payment amount match nahi hua." });
     }
@@ -2140,6 +2209,9 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
     }
 
     // Ab jaake asli Order banega — payment success confirm hone ke baad
+        if (!(await chargeWalletPortion(pending))) {
+      return res.status(200).json({ message: "Wallet balance kam pad gaya, aapka gateway wala paisa wallet me refund kar diya gaya." });
+    }
     const order = await Order.create({
       user: pending.user,
       planName: pending.planName,
@@ -2151,6 +2223,7 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
       couponCode: pending.couponCode,
       discountAmount: pending.discountAmount,
       finalAmount: pending.finalAmount,
+            walletUsed: pending.walletUsed || 0,
       status: "pending", // fulfillment status - admin isko update karega
       razorpayOrderId: razorpay_order_id,
       razorpayPaymentId: razorpay_payment_id,
@@ -2158,6 +2231,7 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
     });
 
     await decrementRamStock(order.vpsId, order.category, order.ram);
+        await recordWalletPortion(order);
 
     // Coupon ka usedCount badhao (agar coupon use hua tha)
     if (pending.couponCode) {
@@ -2192,7 +2266,7 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
     }
 
     // ✅ EXTRA CHECK — amount match karo
-    if (Number(cfOrder.data.order_amount) !== Number(pending.finalAmount)) {
+    if (Number(cfOrder.data.order_amount) !== Number(pending.finalAmount - (pending.walletUsed || 0))) {
       return res.status(400).json({ message: "Payment amount match nahi hua." });
     }
 
@@ -2223,6 +2297,9 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
       }
       return res.status(201).json({ message: "Renewal payment successful!", renewal });
     }
+        if (!(await chargeWalletPortion(pending))) {
+      return res.status(200).json({ message: "Wallet balance kam pad gaya, aapka gateway wala paisa wallet me refund kar diya gaya." });
+    }
 
     const order = await Order.create({
       user: pending.user,
@@ -2235,6 +2312,7 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
       couponCode: pending.couponCode,
       discountAmount: pending.discountAmount,
       finalAmount: pending.finalAmount,
+            walletUsed: pending.walletUsed || 0,
       status: "pending",
       cfOrderId: orderId,
       cfPaymentId,
@@ -2243,6 +2321,7 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
     });
 
     await decrementRamStock(order.vpsId, order.category, order.ram);
+        await recordWalletPortion(order);
 
     if (pending.couponCode) {
       await Coupon.updateOne({ code: pending.couponCode }, { $inc: { usedCount: 1 } });
@@ -4567,7 +4646,7 @@ app.post("/api/webhooks/razorpay", async (req, res) => {
       return res.status(200).json({ message: "Pending record not found." });
     }
 
-    const expectedAmountInPaise = Math.round(pending.finalAmount * 100);
+        const expectedAmountInPaise = Math.round((pending.finalAmount - (pending.walletUsed || 0)) * 100);
     if (paymentEntity.amount !== expectedAmountInPaise) {
       console.error(`Webhook: amount mismatch order ${razorpay_order_id} ke liye.`);
       return res.status(200).json({ message: "Amount mismatch." });
@@ -4575,6 +4654,9 @@ app.post("/api/webhooks/razorpay", async (req, res) => {
         if (pending.type === "renewal") {
       await finalizeRenewal(pending, { gateway: "razorpay", razorpayPaymentId: razorpay_payment_id });
       return res.status(200).json({ message: "Renewal created via webhook." });
+    }
+        if (!(await chargeWalletPortion(pending))) {
+      return res.status(200).json({ message: "Wallet insufficient, refunded." });
     }
 
     const order = await Order.create({
@@ -4588,6 +4670,7 @@ app.post("/api/webhooks/razorpay", async (req, res) => {
       couponCode: pending.couponCode,
       discountAmount: pending.discountAmount,
       finalAmount: pending.finalAmount,
+            walletUsed: pending.walletUsed || 0,
       status: "pending",
       razorpayOrderId: razorpay_order_id,
       razorpayPaymentId: razorpay_payment_id,
@@ -4595,6 +4678,7 @@ app.post("/api/webhooks/razorpay", async (req, res) => {
     });
 
     await decrementRamStock(order.vpsId, order.category, order.ram);
+        await recordWalletPortion(order);
 
     if (pending.couponCode) {
       await Coupon.updateOne({ code: pending.couponCode }, { $inc: { usedCount: 1 } });
@@ -4658,13 +4742,16 @@ app.post("/api/webhooks/cashfree", async (req, res) => {
       return res.status(200).json({ message: "Pending record not found." });
     }
 
-    if (Number(orderData.order_amount) !== Number(pending.finalAmount)) {
+    if (Number(orderData.order_amount) !== Number(pending.finalAmount - (pending.walletUsed || 0))) {
       console.error(`Cashfree webhook: amount mismatch order ${cfOrderId} ke liye.`);
       return res.status(200).json({ message: "Amount mismatch." });
     }
         if (pending.type === "renewal") {
       await finalizeRenewal(pending, { gateway: "cashfree", cfPaymentId });
       return res.status(200).json({ message: "Renewal created via webhook." });
+    }
+        if (!(await chargeWalletPortion(pending))) {
+      return res.status(200).json({ message: "Wallet insufficient, refunded." });
     }
 
     const order = await Order.create({
@@ -4678,6 +4765,7 @@ app.post("/api/webhooks/cashfree", async (req, res) => {
       couponCode: pending.couponCode,
       discountAmount: pending.discountAmount,
       finalAmount: pending.finalAmount,
+            walletUsed: pending.walletUsed || 0,
       status: "pending",
       cfOrderId,
       cfPaymentId,
@@ -4686,6 +4774,7 @@ app.post("/api/webhooks/cashfree", async (req, res) => {
     });
 
     await decrementRamStock(order.vpsId, order.category, order.ram);
+        await recordWalletPortion(order);
 
     if (pending.couponCode) {
       await Coupon.updateOne({ code: pending.couponCode }, { $inc: { usedCount: 1 } });
