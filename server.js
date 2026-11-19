@@ -1181,6 +1181,74 @@ app.put("/api/admin/vm-controls", protect, isAdmin, async (req, res) => {
   }
 });
 // ==================== END VM CONTROL LOCK ====================
+// ==================== PAYMENT GATEWAY LOCK ====================
+const GATEWAY_KEYS = ["razorpay", "cashfree"];
+
+const gatewaySettingSchema = new mongoose.Schema(
+  {
+    key: { type: String, default: "gateways", unique: true },
+    disabled: { type: mongoose.Schema.Types.Mixed, default: {} },
+    notice: { type: String, default: "" },
+  },
+  { timestamps: true }
+);
+const GatewaySetting = mongoose.model("GatewaySetting", gatewaySettingSchema);
+
+async function getGatewaySettings() {
+  const doc = await GatewaySetting.findOne({ key: "gateways" }).lean();
+  const disabled = {};
+  GATEWAY_KEYS.forEach((k) => { disabled[k] = !!(doc && doc.disabled && doc.disabled[k]); });
+  return { disabled, notice: (doc && doc.notice) || "" };
+}
+
+// Agar gateway band hai to message return karta hai, warna null
+async function gatewayBlocked(gateway) {
+  if (!GATEWAY_KEYS.includes(gateway)) return null; // wallet ko kabhi mat roko
+  const s = await getGatewaySettings();
+  return s.disabled[gateway]
+    ? (s.notice || "Ye payment method abhi band hai. Dusra method use karo.")
+    : null;
+}
+
+// PUBLIC: user side ko batane ke liye kaun sa gateway band hai
+app.get("/api/payment-gateways", async (req, res) => {
+  try { res.json(await getGatewaySettings()); }
+  catch (e) { res.status(500).json({ message: "Server error" }); }
+});
+
+// ADMIN: settings dekho
+app.get("/api/admin/payment-gateways", protect, isAdmin, async (req, res) => {
+  try { res.json(await getGatewaySettings()); }
+  catch (e) { res.status(500).json({ message: "Server error" }); }
+});
+
+// ADMIN: settings save karo
+app.put("/api/admin/payment-gateways", protect, isAdmin, async (req, res) => {
+  try {
+    const input = req.body.disabled || {};
+    const disabled = {};
+    GATEWAY_KEYS.forEach((k) => { disabled[k] = input[k] === true; });
+    const notice = String(req.body.notice || "").trim().slice(0, 300);
+
+    await GatewaySetting.findOneAndUpdate(
+      { key: "gateways" },
+      { disabled, notice },
+      { upsert: true, new: true }
+    );
+
+    try {
+      const off = GATEWAY_KEYS.filter((k) => disabled[k]);
+      sendTelegramMessage(
+        `💳 <b>Payment Gateway Lock Updated</b>\n\nBand: ${off.length ? off.join(", ") : "Koi nahi (sab chalu)"}\n📝 Notice: ${escapeHtml(notice || "-")}`
+      );
+    } catch (e) {}
+
+    res.json({ message: "Save ho gaya.", disabled, notice });
+  } catch (e) {
+    res.status(500).json({ message: "Server error", error: e.message });
+  }
+});
+// ==================== END PAYMENT GATEWAY LOCK ====================
 app.get("/api/admin/maintenance", protect, isAdmin, async (req, res) => {
   maintCache.at = 0;
   const m = await getMaintenance();
@@ -1932,6 +2000,8 @@ app.post("/api/vps/create-payment", protect, async (req, res) => {
     const { vpsId, ram, couponCode, category, gateway } = req.body;
     const selectedGateway = ["cashfree", "razorpay", "wallet"].includes(gateway) ? gateway : ACTIVE_GATEWAY;
     const cat = category === "linux" ? "linux" : "vps";
+    const blockMsg = await gatewayBlocked(selectedGateway);
+if (blockMsg) return res.status(423).json({ message: blockMsg, gatewayLocked: true });
 
     const plan = await VpsPlan.findOne({ vpsId, category: cat });
     if (!plan) {
@@ -2421,6 +2491,8 @@ app.post("/api/vps/renew/create-payment", protect, renewLimiter, async (req, res
   try {
     const { orderId, gateway, couponCode } = req.body;
     const selectedGateway = ["cashfree", "razorpay", "wallet"].includes(gateway) ? gateway : ACTIVE_GATEWAY;
+    const blockMsg = await gatewayBlocked(selectedGateway);
+if (blockMsg) return res.status(423).json({ message: blockMsg, gatewayLocked: true });
     if (typeof orderId !== "string" || !mongoose.Types.ObjectId.isValid(orderId))
       return res.status(400).json({ message: "Invalid order." });
 
@@ -3772,6 +3844,8 @@ app.get("/api/wallet/transactions", protect, async (req, res) => {
 // ---------- STEP 1: WALLET RECHARGE ORDER BANAO (Razorpay) ----------
 app.post("/api/wallet/create-recharge-order", protect, async (req, res) => {
   try {
+    const blockMsg = await gatewayBlocked("razorpay");
+if (blockMsg) return res.status(423).json({ message: blockMsg, gatewayLocked: true });
     const { amount } = req.body;
     const amt = Number(amount);
 
