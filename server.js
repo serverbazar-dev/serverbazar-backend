@@ -4910,6 +4910,10 @@ async function syncPlanStockFromPool(vpsId, category) {
       const plan = await VpsPlan.findOne({ vpsId, category });
       if (!plan) return;
 
+      // Plan out of stock hai to ready stock add hone par bhi khud in-stock mat karo.
+      // Admin "Mark In Stock" dabayega tabhi chalu hoga.
+      if (plan.available === false) return;
+
       const manual = Math.max(0, Number(plan.manualStockQty) || 0);
       const total = poolTotal + manual;
 
