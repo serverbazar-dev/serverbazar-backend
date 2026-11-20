@@ -5173,6 +5173,53 @@ app.delete("/api/admin/stock-items/:id", protect, isAdmin, async (req, res) => {
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
+// ---------- ADMIN: READY STOCK WALE PLAN KO EK CLICK ME IN STOCK KARO ----------
+// Plan available=true hota hai, manual stock 0 hota hai, aur stockQty = pool ke "available" servers.
+// RAM options me sirf wahi in-stock honge jinka pool me server hai.
+app.put("/api/admin/stock-items/activate-plan", protect, isAdmin, async (req, res) => {
+  try {
+    const { vpsId } = req.body;
+    const cat = req.body.category === "linux" ? "linux" : "vps";
+
+    if (typeof vpsId !== "string" || !vpsId.trim() || vpsId.length > 100) {
+      return res.status(400).json({ message: "Valid vpsId zaroori hai." });
+    }
+
+    const plan = await VpsPlan.findOne({ vpsId: vpsId.trim(), category: cat });
+    if (!plan) return res.status(404).json({ message: "Plan nahi mila." });
+
+    const poolCount = await StockItem.countDocuments({
+      vpsId: plan.vpsId, category: cat, status: "available",
+    });
+    if (poolCount === 0) {
+      return res.status(400).json({ message: "Is plan ka ready stock (available server) nahi hai. Pehle server add karo." });
+    }
+
+    // Pehle available=true karo (sync function out-of-stock plan ko skip karta hai),
+    // manual stock 0 karo taaki sirf ready stock jitna hi stock bane
+    await VpsPlan.updateOne(
+      { _id: plan._id },
+      { $set: { available: true, manualStockQty: 0 } }
+    );
+    await syncPlanStockFromPool(plan.vpsId, cat);
+
+    const fresh = await VpsPlan.findById(plan._id).select("vpsId nameOrIp available stockQty ramOptions");
+
+    try {
+      sendTelegramMessage(
+        `✅ <b>Plan In Stock (Ready Stock se)</b>\n\n📦 ${escapeHtml(fresh.nameOrIp)} (${escapeHtml(fresh.vpsId)})\n🔢 Stock: ${fresh.stockQty}`
+      );
+    } catch (e) {}
+
+    res.json({
+      message: `Plan in stock ho gaya. Stock: ${fresh.stockQty}`,
+      stockQty: fresh.stockQty,
+      available: fresh.available,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
 
 app.post("/api/admin/orders/:id/auto-deliver", protect, isAdmin, async (req, res) => {
   try {
