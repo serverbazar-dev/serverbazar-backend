@@ -5220,6 +5220,51 @@ app.put("/api/admin/stock-items/activate-plan", protect, isAdmin, async (req, re
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
+// ---------- ADMIN: SAARE READY-STOCK WALE OUT-OF-STOCK PLANS EK CLICK ME IN STOCK ----------
+app.put("/api/admin/stock-items/activate-all", protect, isAdmin, async (req, res) => {
+  try {
+    const rows = await StockItem.aggregate([
+      { $match: { status: "available" } },
+      { $group: { _id: { vpsId: "$vpsId", category: "$category" }, n: { $sum: 1 } } },
+    ]);
+
+    const activated = [];
+    for (const r of rows) {
+      const { vpsId, category } = r._id;
+      const plan = await VpsPlan.findOne({ vpsId, category });
+      if (!plan) continue;
+
+      const isOut = plan.available === false || !(plan.stockQty > 0);
+      if (!isOut) continue;
+
+      await VpsPlan.updateOne(
+        { _id: plan._id },
+        { $set: { available: true, manualStockQty: 0 } }
+      );
+      await syncPlanStockFromPool(vpsId, category);
+
+      const fresh = await VpsPlan.findById(plan._id).select("nameOrIp stockQty");
+      activated.push(`${fresh.nameOrIp} (${vpsId}) — stock: ${fresh.stockQty}`);
+    }
+
+    if (activated.length) {
+      try {
+        sendTelegramMessage(
+          `⚡ <b>Saare Ready Plans In Stock</b>\n\n` + activated.map((a) => "• " + escapeHtml(a)).join("\n")
+        );
+      } catch (e) {}
+    }
+
+    res.json({
+      message: activated.length
+        ? `${activated.length} plan in stock ho gaye.`
+        : "Koi out-of-stock plan nahi mila jiske paas ready server ho.",
+      activated,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
 
 app.post("/api/admin/orders/:id/auto-deliver", protect, isAdmin, async (req, res) => {
   try {
