@@ -364,10 +364,65 @@ app.get("/api/maintenance-status", async (req, res) => {
   res.json({ enabled: m.enabled, message: m.message });
 });
 // ==================== END MAINTENANCE MODE ====================
+// ==================== SECURITY ALERTS (TELEGRAM) ====================
+const secThrottle = new Map();
+const secCounters = new Map();
+
+function trackFail(key, limit = 5, windowMs = 15 * 60 * 1000) {
+  const now = Date.now();
+  const arr = (secCounters.get(key) || []).filter((t) => now - t < windowMs);
+  arr.push(now);
+  secCounters.set(key, arr);
+  if (secCounters.size > 5000) {
+    for (const [k, v] of secCounters) if (!v.length || now - v[v.length - 1] > windowMs) secCounters.delete(k);
+  }
+  return arr.length >= limit;
+}
+
+async function securityAlert(type, req, userOrId, details = "", opts = {}) {
+  try {
+    const now = Date.now();
+    const key = `${type}:${opts.key || (req && req.ip) || ""}`;
+    if (now - (secThrottle.get(key) || 0) < (opts.cooldownMs ?? 120000)) return;
+    secThrottle.set(key, now);
+    if (secThrottle.size > 5000) {
+      for (const [k, t] of secThrottle) if (now - t > 600000) secThrottle.delete(k);
+    }
+
+    let u = null;
+    if (userOrId && typeof userOrId === "object") u = userOrId;
+    else if (userOrId && mongoose.Types.ObjectId.isValid(String(userOrId))) {
+      u = await User.findById(userOrId).select("name email phone role").lean();
+    }
+
+    const lines = [
+      `🚨 <b>SECURITY ALERT</b>`,
+      `⚠️ <b>Type:</b> ${escapeHtml(type)}`,
+      ``,
+      `👤 <b>Naam:</b> ${escapeHtml(u?.name || "Unknown / login nahi")}`,
+      `📧 <b>Email:</b> ${escapeHtml(u?.email || opts.email || "-")}`,
+      `📱 <b>Mobile:</b> ${escapeHtml(u?.phone || "-")}`,
+      `🎭 <b>Role:</b> ${escapeHtml(u?.role || "-")}`,
+      `🌐 <b>IP:</b> <code>${escapeHtml(req?.ip || "-")}</code>`,
+      `🔗 <b>Route:</b> ${escapeHtml(req ? `${req.method} ${req.originalUrl}`.slice(0, 150) : "-")}`,
+      `🖥️ <b>Device:</b> ${escapeHtml(String(req?.headers?.["user-agent"] || "-").slice(0, 120))}`,
+      `📝 <b>Detail:</b> ${escapeHtml(String(details).slice(0, 400))}`,
+      `🕒 ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}`,
+    ];
+    sendTelegramMessage(lines.join("\n"));
+  } catch (e) {}
+}
+
+const limitHandler = (name) => (req, res, next, options) => {
+  securityAlert("rate_limit_hit", req, null, `Limiter: ${name}`, { cooldownMs: 300000, key: `${name}:${req.ip}` });
+  res.status((options && options.statusCode) || 429).send((options && options.message) || { message: "Bahut zyada requests. Thodi der baad try karo." });
+};
+// ==================== END SECURITY ALERTS ====================
 // Login/Register ke liye limiter — 15 min me max 30 tries per IP
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 30,
+  handler: limitHandler("auth"),
   message: { message: "Bahut zyada attempts ho gaye. 15 minute baad try karo." },
 });
 
@@ -375,16 +430,19 @@ const authLimiter = rateLimit({
 const couponLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
+  handler: limitHandler("coupon"),
   message: { message: "Bahut zyada coupon attempts. Thodi der baad try karo." },
 });
 const proxyConnectLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
+  handler: limitHandler("proxy"),
   message: { message: "Bahut zyada connect attempts. 15 minute baad try karo." },
 });
 const renewLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 15,
+  handler: limitHandler("renew"),
   message: { message: "Bahut zyada renewal attempts. Thodi der baad try karo." },
 });
 
@@ -1090,6 +1148,9 @@ const protect = (req, res, next) => {
     }
     next();
   } catch (err) {
+        if (err.name === "JsonWebTokenError") {
+      securityAlert("fake_jwt_token", req, null, err.message, { cooldownMs: 300000 });
+    }
     return res.status(401).json({ message: "Token invalid ya expire ho gaya." });
   }
 };
@@ -1099,6 +1160,7 @@ const isAdmin = async (req, res, next) => {
   try {
     const user = await User.findById(req.userId);
     if (!user || user.role !== "admin") {
+            securityAlert("admin_route_access_attempt", req, user || req.userId, "Non-admin ne admin route hit kiya", { key: String(req.userId) });
       return res.status(403).json({ message: "Sirf admin ke liye access hai." });
     }
     next();
@@ -1695,16 +1757,19 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
 
     // ✅ NAYA CHECK — sirf text allow karo, object/array nahi
     if (typeof email !== "string" || typeof password !== "string") {
+            securityAlert("login_bad_input_type", req, null, "email/password string nahi tha (injection try?)");
       return res.status(400).json({ message: "Email ya password galat format me hai." });
     }
 
     const user = await User.findOne({ email: email.toLowerCase().trim() });
     if (!user) {
+            if (trackFail(`login:${req.ip}:${email}`)) securityAlert("login_bruteforce", req, null, `5+ galat login, email: ${email}`, { email, key: email });
       return res.status(400).json({ message: "Email ya password galat hai." });
     }
 
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
+            if (trackFail(`login:${req.ip}:${email}`)) securityAlert("login_bruteforce", req, user, "Is account par 5+ galat password try hue", { key: email });
       return res.status(400).json({ message: "Email ya password galat hai." });
     }
 
@@ -2230,12 +2295,14 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
 
     if (expectedSignature !== razorpay_signature) {
       logPurchaseActivity({ user: req.userId, gateway: "razorpay", stage: "verify-payment", status: "failed", message: "Signature match nahi hui." });
+            securityAlert("FAKE_PAYMENT_signature_mismatch", req, req.userId, `Razorpay order: ${razorpay_order_id}, payment: ${razorpay_payment_id}`, { key: String(req.userId) });
       return res.status(400).json({ message: "Payment verify nahi ho paya. Signature match nahi hui." });
     }
 
     // Pending record dhundo jo humne create-payment step me banaya tha
     const pending = await PendingPayment.findOne({ razorpayOrderId: razorpay_order_id, user: req.userId });
     if (!pending) {
+            securityAlert("payment_record_not_found_or_replay", req, req.userId, `Razorpay order: ${razorpay_order_id}`, { key: String(req.userId) });
       return res.status(404).json({ message: "Payment record nahi mila ya already process ho chuka hai." });
     }
 
@@ -2253,15 +2320,18 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
     }
 
     if (razorpayPaymentDetails.status !== "captured") {
+            securityAlert("payment_not_captured", req, req.userId, `Status: ${razorpayPaymentDetails.status}, payment: ${razorpay_payment_id}`, { key: String(req.userId) });
       return res.status(400).json({ message: `Payment abhi captured nahi hua (status: ${razorpayPaymentDetails.status}).` });
     }
 
     if (razorpayPaymentDetails.order_id !== razorpay_order_id) {
+            securityAlert("FAKE_PAYMENT_order_mismatch", req, req.userId, `Payment ${razorpay_payment_id} kisi aur order ka tha`, { key: String(req.userId) });
       return res.status(400).json({ message: "Payment kisi aur order ka hai." });
     }
 
         const expectedAmountInPaise = Math.round((pending.finalAmount - (pending.walletUsed || 0)) * 100);
     if (razorpayPaymentDetails.amount !== expectedAmountInPaise) {
+            securityAlert("FAKE_PAYMENT_amount_mismatch", req, req.userId, `Expected paise: ${expectedAmountInPaise}, mila: ${razorpayPaymentDetails.amount}`, { key: String(req.userId) });
       return res.status(400).json({ message: "Payment amount match nahi hua." });
     }
 
@@ -2326,17 +2396,20 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
 
     const cfOrder = await cashfreeClient.PGFetchOrder(orderId);
     if (cfOrder.data.order_status !== "PAID") {
+            securityAlert("payment_not_paid_cashfree", req, req.userId, `orderId: ${orderId}, status: ${cfOrder.data.order_status}`, { key: String(req.userId) });
       logPurchaseActivity({ user: req.userId, gateway: "cashfree", stage: "verify-payment", status: "failed", message: `Payment status: ${cfOrder.data.order_status}` });
       return res.status(400).json({ message: `Payment abhi confirm nahi hua (status: ${cfOrder.data.order_status}).` });
     }
 
     const pending = await PendingPayment.findOne({ cfOrderId: orderId, user: req.userId });
     if (!pending) {
+            securityAlert("payment_record_not_found_or_replay", req, req.userId, `Cashfree orderId: ${orderId}`, { key: String(req.userId) });
       return res.status(404).json({ message: "Payment record nahi mila ya already process ho chuka hai." });
     }
 
     // ✅ EXTRA CHECK — amount match karo
     if (Number(cfOrder.data.order_amount) !== Number(pending.finalAmount - (pending.walletUsed || 0))) {
+            securityAlert("FAKE_PAYMENT_amount_mismatch_cashfree", req, req.userId, `orderId: ${orderId}, cashfree amount: ${cfOrder.data.order_amount}`, { key: String(req.userId) });
       return res.status(400).json({ message: "Payment amount match nahi hua." });
     }
 
@@ -3886,6 +3959,7 @@ app.post("/api/wallet/verify-recharge", protect, async (req, res) => {
       .digest("hex");
 
     if (expectedSignature !== razorpay_signature) {
+            securityAlert("FAKE_WALLET_RECHARGE_signature", req, req.userId, `order: ${razorpay_order_id}, payment: ${razorpay_payment_id}`, { key: String(req.userId) });
       return res.status(400).json({ message: "Signature match nahi hui." });
     }
 
@@ -3912,6 +3986,7 @@ app.post("/api/wallet/verify-recharge", protect, async (req, res) => {
 
     const expectedPaise = Math.round(Number(amount) * 100);
     if (paymentDetails.amount !== expectedPaise) {
+            securityAlert("FAKE_WALLET_RECHARGE_amount", req, req.userId, `Claim: ₹${amount}, asli paise: ${paymentDetails.amount}`, { key: String(req.userId) });
       return res.status(400).json({ message: "Amount match nahi hua." });
     }
 
@@ -4690,6 +4765,7 @@ app.post("/api/webhooks/razorpay", async (req, res) => {
 
     if (expectedSignature !== signature) {
       console.error("Razorpay webhook: signature mismatch, ignore kar rahe hain.");
+            securityAlert("FAKE_WEBHOOK_razorpay_invalid_signature", req, null, "Webhook signature galat", { cooldownMs: 60000 });
       return res.status(400).json({ message: "Invalid signature." });
     }
 
@@ -4786,6 +4862,7 @@ app.post("/api/webhooks/cashfree", async (req, res) => {
       cashfreeClient.PGVerifyWebhookSignature(signature, req.rawBody.toString(), timestamp);
     } catch (sigErr) {
       console.error("Cashfree webhook: signature mismatch, ignore kar rahe hain.", sigErr.message);
+            securityAlert("FAKE_WEBHOOK_cashfree_invalid_signature", req, null, "Webhook signature galat", { cooldownMs: 60000 });
       return res.status(400).json({ message: "Invalid signature." });
     }
 
