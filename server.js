@@ -680,6 +680,8 @@ function sendTelegramMessageToChat(token, chatId, text) {
     hostname: "api.telegram.org",
     path: `/bot${token}/sendMessage`,
     method: "POST",
+    family: 4,
+    timeout: 15000,
     headers: {
       "Content-Type": "application/json",
       "Content-Length": Buffer.byteLength(payload),
@@ -696,7 +698,10 @@ function sendTelegramMessageToChat(token, chatId, text) {
     });
   });
 
-  req.on("error", (err) => console.error(`Telegram alert error (chat ${chatId}):`, err.message));
+  req.on("timeout", () => req.destroy(new Error("timeout")));
+  req.on("error", (err) =>
+    console.error(`Telegram alert error (chat ${chatId}):`, err.code || "", err.message || "", err.errors ? err.errors.map((e) => e.code).join(",") : "")
+  );
   req.write(payload);
   req.end();
 }
