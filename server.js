@@ -371,6 +371,9 @@ function vzFlattenOs(oslist) {
 const app = express();
 const isSafeVmPassword = (p) =>
   typeof p === "string" && p.length >= 8 && p.length <= 72 && !/[<>"'`\\&\s]/.test(p);
+
+const isAlnumVmPassword = (p) =>
+  typeof p === "string" && /^[A-Za-z0-9]{8,72}$/.test(p);
 app.set('trust proxy', 1);
 
 const allowedOrigins = [
@@ -655,6 +658,7 @@ function serializeOrderForUser(order) {
   }
   delete o.panelPasswordEnc;
   delete o.shareTokenHash;
+  delete o.pwSetValueEnc;
   return o;
 }
 
@@ -922,10 +926,87 @@ panelPasswordEnc: { type: String, default: "" },
 shareTokenHash: { type: String, index: true, sparse: true },
 shareEnabled: { type: Boolean, default: false },
 puttyInfo: { type: String, default: "" },
+pwSetPending: { type: Boolean, default: false },
+pwSetValueEnc: { type: String, default: "" },
+pwSetAfter: { type: Date },
+pwSetTries: { type: Number, default: 0 },
+pwSetProvider: { type: String, enum: ["hh", "pv", ""], default: "" },
   },
   { timestamps: true }
 );
 const Order = mongoose.model("Order", orderSchema);
+// ==================== REBUILD PASSWORD AUTO-SET ====================
+// Sirf letters + numbers (HostHeaven special character accept nahi karta)
+function genVmPassword() {
+  const U = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+  const L = "abcdefghijkmnopqrstuvwxyz";
+  const D = "23456789";
+  const pick = (set, n) => Array.from({ length: n }, () => set[crypto.randomInt(set.length)]);
+  const chars = [...pick(U, 3), ...pick(L, 6), ...pick(D, 3)];
+  for (let i = chars.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(i + 1);
+    [chars[i], chars[j]] = [chars[j], chars[i]];
+  }
+  return chars.join(""); // 12 characters, e.g. "kP7mXq3dTa9w"
+}
+
+async function scheduleRebuildPassword(order, provider) {
+  order.pwSetPending = true;
+  order.pwSetValueEnc = encryptSecret(genVmPassword());
+  order.pwSetAfter = new Date(Date.now() + 4 * 60 * 1000); // 3 min baad pehli koshish
+  order.pwSetTries = 0;
+  order.pwSetProvider = provider;
+  await order.save();
+}
+
+async function applyVmPassword(order, pw) {
+  let data;
+  if (order.pwSetProvider === "pv") {
+    await pvLogin();
+    data = await pvApi(`/api/users/${pvUserId}/vms/${Number(order.pvVmId)}/password`, "PUT", { password: pw });
+  } else {
+    await getHostHeavenToken();
+    data = await hostHeavenAPI(`/api/users/${hostHeavenUserId}/vms/${Number(order.vmId)}/password`, "PUT", { password: pw });
+  }
+  return /success|updated/i.test(data?.message || "");
+}
+
+let pwWorkerRunning = false;
+async function processRebuildPasswords() {
+  if (pwWorkerRunning || mongoose.connection.readyState !== 1) return;
+  pwWorkerRunning = true;
+  try {
+    const list = await Order.find({ pwSetPending: true, pwSetAfter: { $lte: new Date() } }).limit(20);
+    for (const o of list) {
+      try {
+        const pw = decryptSecret(o.pwSetValueEnc);
+        if (!(await applyVmPassword(o, pw))) throw new Error("password set nahi hua");
+        o.deliveryPassword = pw;
+        o.pwSetPending = false;
+        o.pwSetValueEnc = "";
+        await o.save();
+      } catch (e) {
+        o.pwSetTries += 1;
+        if (o.pwSetTries >= 16) {
+          o.pwSetPending = false;
+          o.pwSetValueEnc = "";
+          try {
+            sendTelegramMessage(`⚠️ <b>Rebuild ke baad password set fail</b>\nOrder: <code>${escapeHtml(o._id)}</code>\nIP: ${escapeHtml(o.deliveryIp || "-")}\nPanel se password dekh ke manually update karo.`);
+          } catch (_) {}
+        } else {
+          o.pwSetAfter = new Date(Date.now() + 30 * 1000);
+        }
+        await o.save();
+      }
+    }
+  } catch (err) {
+    console.error("processRebuildPasswords error:", err.message);
+  } finally {
+    pwWorkerRunning = false;
+  }
+}
+mongoose.connection.once("open", () => setInterval(processRebuildPasswords, 30 * 1000));
+// ==================== END REBUILD PASSWORD AUTO-SET ====================
 
 const vpsPlanSchema = new mongoose.Schema(
   {
@@ -3187,8 +3268,8 @@ app.post("/api/vps/hostheaven-control", protect, guardVm(actionKey), async (req,
 app.post("/api/vps/hostheaven-change-password", protect, guardVm("password"), async (req, res) => {
   try {
     const { vmId, newPassword } = req.body;
-    if (!isSafeVmPassword(newPassword)) {
-  return res.json({ success: false, message: "Password 8-72 characters ka ho, aur space ya < > \" ' ` \\ & use na karo." });
+    if (!isAlnumVmPassword(newPassword)) {
+  return res.json({ success: false, message: "Password 8-72 characters ka ho, sirf letters aur numbers (special character nahi)." });
 }
     const order = await findOwnedOrderByVmId(req.userId, vmId);
     if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
@@ -3199,8 +3280,13 @@ app.post("/api/vps/hostheaven-change-password", protect, guardVm("password"), as
       body: JSON.stringify({ password: newPassword }),
     });
     const data = await result.json();
-    order.deliveryPassword = newPassword;
-    await order.save();
+if (!/success|updated/i.test(data?.message || "")) {
+  return res.json({ success: false, message: data?.message || data?.error || "Password change nahi hua." });
+}
+order.deliveryPassword = newPassword;
+order.pwSetPending = false;     // pending auto-password ko cancel karo
+order.pwSetValueEnc = "";
+await order.save();
     res.json({ success: true, data });
   } catch (err) {
     res.json({ success: false, message: err.message });
@@ -3248,8 +3334,9 @@ app.post("/api/vps/hostheaven-rebuild", protect, guardVm("rebuild"), async (req,
     const data = await result.json();
     setTimeout(() => rebuildInProgress.delete(String(vmId)), 3 * 60 * 1000);
     if (data.message === "Rebuild initiated.") {
-      res.json({ success: true, data });
-    } else {
+  await scheduleRebuildPassword(order, "hh");
+  res.json({ success: true, data });
+} else {
       rebuildInProgress.delete(String(vmId));
       res.json({ success: false, message: data.message || "Failed" });
     }
@@ -3495,6 +3582,8 @@ app.post("/api/pv/change-password", protect, guardVm("password"), async (req, re
       return res.json({ success: false, message: data?.message || data?.error || "Password change nahi hua." });
     }
     order.deliveryPassword = newPassword;
+    order.pwSetPending = false;
+order.pwSetValueEnc = "";
     await order.save();
     res.json({ success: true, data });
   } catch (err) {
@@ -3540,8 +3629,9 @@ app.post("/api/pv/rebuild", protect, guardVm("rebuild"), async (req, res) => {
     const data = await pvApi(`/api/users/${pvUserId}/vms/${Number(vmId)}/rebuild?isoId=${validIso.id}`, "POST", {});
     setTimeout(() => pvRebuildInProgress.delete(lockKey), 3 * 60 * 1000);
     if (data.message === "Rebuild initiated.") {
-      res.json({ success: true, data });
-    } else {
+  await scheduleRebuildPassword(order, "pv");
+  res.json({ success: true, data });
+} else {
       pvRebuildInProgress.delete(lockKey);
       res.json({ success: false, message: data.message || "Failed" });
     }
@@ -3886,7 +3976,8 @@ app.get("/api/share/:token", shareLimiter, async (req, res) => {
       username: o.deliveryUsername || "root",
       password: o.deliveryPassword,
       os: o.deliveryOS,
-      expiresAt: o.expiresAt,
+            expiresAt: o.expiresAt,
+      pwSetPending: !!o.pwSetPending,
       liveState,
     });
   } catch (err) {
@@ -3987,6 +4078,7 @@ app.post("/api/share/:token/rebuild", shareLimiter, guardVm("rebuild"), async (r
       await pvLogin();
       const data = await pvApi(`/api/users/${pvUserId}/vms/${Number(o.pvVmId)}/rebuild?isoId=${valid.id}`, "POST", {});
       if (data.message !== "Rebuild initiated.") throw new Error(data.message || "Failed");
+      await scheduleRebuildPassword(o, "pv");
     } else if (o.mxVmId) {
       const opts = (await mxApi(`/vms/${o.mxVmId}/os-options`)).data || [];
       const valid = opts.find(x => x.id === isoId);
@@ -4021,6 +4113,7 @@ app.post("/api/share/:token/rebuild", shareLimiter, guardVm("rebuild"), async (r
       await getHostHeavenToken();
       const data = await hostHeavenAPI(`/api/users/${hostHeavenUserId}/vms/${Number(o.vmId)}/rebuild?isoId=${valid.id}`, "POST", {});
       if (data.message !== "Rebuild initiated.") throw new Error(data.message || "Failed");
+      await scheduleRebuildPassword(o, "hh");
     }
     res.json({ success: true });
   } catch (err) {
@@ -4420,7 +4513,7 @@ app.put("/api/admin/users/:id/role", protect, isAdmin, async (req, res) => {
 app.get("/api/admin/orders", protect, isAdmin, async (req, res) => {
   try {
     const orders = await Order.find()
-  .select("-panelPasswordEnc -shareTokenHash")
+  .select("-panelPasswordEnc -shareTokenHash -pwSetValueEnc")
   .populate("user", "name email phone")
   .sort({ createdAt: -1 });
     res.json(orders);
@@ -4489,7 +4582,7 @@ app.get("/api/admin/reports/revenue/day", protect, isAdmin, async (req, res) => 
     if (category === "vps" || category === "linux") filter.category = category;
 
     const orders = await Order.find(filter)
-  .select("-panelPasswordEnc -shareTokenHash")
+  .select("-panelPasswordEnc -shareTokenHash -pwSetValueEnc")
   .populate("user", "name email phone")
   .sort({ createdAt: -1 });
 
@@ -4560,7 +4653,7 @@ app.delete("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
 app.get("/api/admin/format-requests", protect, isAdmin, async (req, res) => {
   try {
     const requests = await Order.find({ formatStatus: "pending" })
-  .select("-panelPasswordEnc -shareTokenHash")
+  .select("-panelPasswordEnc -shareTokenHash -pwSetValueEnc")
   .populate("user", "name email phone")
   .sort({ formatRequestedAt: -1 });
     res.json(requests);
