@@ -3835,7 +3835,7 @@ app.post("/api/vps/orders/:id/share", protect, async (req, res) => {
       return res.status(400).json({ message: "Invalid order." });
     const order = await Order.findOne({ _id: req.params.id, user: req.userId });
     if (!order) return res.status(404).json({ message: "Order nahi mila." });
-    if (!order.vmId && !order.mxVmId && !order.pvVmId)
+    if (!order.vmId && !order.mxVmId && !order.pvVmId && !order.vzVmId)
       return res.status(400).json({ message: "Is order me VM linked nahi hai." });
 
     const token = crypto.randomBytes(24).toString("hex"); // 48 hex chars
@@ -3875,6 +3875,7 @@ app.get("/api/share/:token", shareLimiter, async (req, res) => {
       if (o.pvVmId) liveState = ((await pvOverview()).orders || []).find(v => Number(v.vmId) === Number(o.pvVmId))?.liveState || "";
       else if (o.mxVmId) liveState = (await mxOverview()).find(v => String(v.id) === String(o.mxVmId))?.power_state || "";
       else if (o.vmId) liveState = ((await getVmOverviewCached()).orders || []).find(v => Number(v.vmId) === Number(o.vmId))?.liveState || "";
+            else if (o.vzVmId) { const vz = (await vzOverview()).find(v => v.vmId === Number(o.vzVmId)); liveState = vz ? (vz.running ? "running" : "stopped") : ""; }
     } catch (e) {}
 
     res.json({
@@ -3917,6 +3918,11 @@ app.post("/api/share/:token/control", shareLimiter, guardVm(actionKey), async (r
     } else if (o.vmId) {
       await getHostHeavenToken();
       await hostHeavenAPI(`/api/users/${hostHeavenUserId}/vms/${Number(o.vmId)}/control?action=${action}`, "POST", {});
+    } else if (o.vzVmId) {
+      const act = action === "reboot" ? "restart" : action;
+      const r = await vzApi(act, { svs: Number(o.vzVmId), do: 1 });
+      if (!r.done) throw new Error("Action nahi hua.");
+      vzOverviewCache = null;
     } else {
       return res.status(400).json({ success: false, message: "VM linked nahi hai." });
     }
@@ -3940,9 +3946,12 @@ app.get("/api/share/:token/isos", shareLimiter, async (req, res) => {
     } else if (o.vmId) {
       const d = await hostHeavenAPI(`/api/users/orders/${Number(o.vmId)}/details`);
       isos = await hostHeavenAPI(`/api/users/zones/${d.zoneId}/isos`);
+    } else if (o.vzVmId) {
+      const r = await vzApi("ostemplate", { svs: Number(o.vzVmId) });
+      isos = vzFlattenOs(r.oslist);
     }
     const list = (Array.isArray(isos) ? isos : []).map(i => ({
-      id: i.id, name: i.name, windows: i.osType === "WINDOWS" || i.family === "windows",
+      id: i.id, name: i.name, windows: i.osType === "WINDOWS" || i.family === "windows" || /windows/i.test(i.name || ""),
     }));
     res.json({ success: true, isos: list });
   } catch (err) {
@@ -3962,6 +3971,7 @@ app.post("/api/share/:token/rebuild", shareLimiter, guardVm("rebuild"), async (r
     if (o.pvVmId) { lockSet = pvRebuildInProgress; lock = String(o.pvVmId); }
     else if (o.mxVmId) { lockSet = mxRebuildInProgress; lock = String(o.mxVmId); }
     else if (o.vmId) { lockSet = rebuildInProgress; lock = String(o.vmId); }
+        else if (o.vzVmId) { lockSet = vzRebuildInProgress; lock = String(o.vzVmId); }
     else return res.status(400).json({ success: false, message: "VM linked nahi hai." });
 
     if (lockSet.has(lock)) return res.json({ success: false, message: "Rebuild already chal rahi hai, thodi der wait karo." });
@@ -3988,6 +3998,21 @@ app.post("/api/share/:token/rebuild", shareLimiter, guardVm("rebuild"), async (r
       o.deliveryOS = valid.name;
       await o.save();
       mxOverviewCache = null;
+    } else if (o.vzVmId) {
+      const r0 = await vzApi("ostemplate", { svs: Number(o.vzVmId) });
+      const valid = vzFlattenOs(r0.oslist).find(x => x.id === isoId);
+      if (!valid) throw new Error("Selected OS valid nahi hai.");
+      const newPassword = crypto.randomBytes(9).toString("base64").replace(/[+/=]/g, "x") + "!9a";
+      const r = await vzApi(
+        "ostemplate",
+        { svs: Number(o.vzVmId) },
+        { reinsos: 1, newos: valid.id, newpass: newPassword, conf: newPassword, vid: Number(o.vzVmId) }
+      );
+      if (!r.done) throw new Error("Rebuild shuru nahi hua.");
+      o.deliveryPassword = newPassword;
+      o.deliveryOS = valid.name;
+      await o.save();
+      vzOverviewCache = null;
     } else {
       const d = await hostHeavenAPI(`/api/users/orders/${Number(o.vmId)}/details`);
       const zoneIsos = await hostHeavenAPI(`/api/users/zones/${d.zoneId}/isos`);
