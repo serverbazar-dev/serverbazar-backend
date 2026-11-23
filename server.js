@@ -5628,6 +5628,204 @@ app.post("/api/admin/orders/:id/auto-deliver", protect, isAdmin, async (req, res
   }
 });
 // ==================== END AUTO-DELIVERY STOCK ====================
+// ==================== SCHEDULED STOCK ACTIVATION (NAYA) ====================
+const stockScheduleSchema = new mongoose.Schema(
+  {
+    vpsId: { type: String, required: true },
+    category: { type: String, enum: ["vps", "linux"], default: "vps" },
+    runAt: { type: Date, required: true },
+    status: {
+      type: String,
+      enum: ["pending", "running", "done", "failed", "cancelled"],
+      default: "pending",
+    },
+    resultMessage: { type: String, default: "" },
+    doneAt: { type: Date, expires: 7 * 24 * 3600 }, // purane records 7 din baad khud delete
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  },
+  { timestamps: true }
+);
+stockScheduleSchema.index({ status: 1, runAt: 1 });
+const StockSchedule = mongoose.model("StockSchedule", stockScheduleSchema);
+
+const stockScheduleLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  message: { message: "Bahut zyada schedule actions. Thodi der baad try karo." },
+});
+
+// Ek plan ko ready stock jitna in-stock karta hai (activate-all wali hi logic, bina purana code chhede)
+async function runScheduledActivation(s) {
+  const plan = await VpsPlan.findOne({ vpsId: s.vpsId, category: s.category });
+  if (!plan) return { ok: false, msg: "Plan nahi mila." };
+
+  if (plan.available !== false && plan.stockQty > 0) {
+    return { ok: true, msg: "Plan pehle se in stock tha.", name: plan.nameOrIp };
+  }
+
+  const poolCount = await StockItem.countDocuments({
+    vpsId: plan.vpsId, category: s.category, status: "available",
+  });
+  if (poolCount === 0) return { ok: false, msg: "Ready server nahi bacha.", name: plan.nameOrIp };
+
+  await VpsPlan.updateOne(
+    { _id: plan._id },
+    { $set: { available: true, manualStockQty: 0 } }
+  );
+  await syncPlanStockFromPool(plan.vpsId, s.category);
+
+  const fresh = await VpsPlan.findById(plan._id).select("nameOrIp stockQty");
+  return { ok: true, msg: `In stock ho gaya. Stock: ${fresh.stockQty}`, name: fresh.nameOrIp };
+}
+
+let stockSchedTickRunning = false;
+async function processStockSchedules() {
+  if (stockSchedTickRunning || mongoose.connection.readyState !== 1) return;
+  stockSchedTickRunning = true;
+  try {
+    for (let i = 0; i < 50; i++) {
+      // atomic claim: ek schedule sirf ek baar chalega
+      const s = await StockSchedule.findOneAndUpdate(
+        { status: "pending", runAt: { $lte: new Date() } },
+        { $set: { status: "running" } },
+        { sort: { runAt: 1 }, new: true }
+      );
+      if (!s) break;
+
+      let r;
+      try { r = await runScheduledActivation(s); }
+      catch (e) { r = { ok: false, msg: e.message }; }
+
+      s.status = r.ok ? "done" : "failed";
+      s.resultMessage = String(r.msg || "").slice(0, 300);
+      s.doneAt = new Date();
+      await s.save();
+
+      try {
+        sendTelegramMessage(
+          `${r.ok ? "⏰✅" : "⏰⚠️"} <b>Scheduled Stock ${r.ok ? "Live" : "Fail"}</b>\n\n📦 ${escapeHtml(r.name || s.vpsId)} (${escapeHtml(s.vpsId)})\n📝 ${escapeHtml(r.msg)}`
+        );
+      } catch (e) {}
+    }
+  } catch (err) {
+    console.error("processStockSchedules error:", err.message);
+  } finally {
+    stockSchedTickRunning = false;
+  }
+}
+
+// DB connect hote hi scheduler chalu (startServer ko chhedna nahi padega)
+mongoose.connection.once("open", () => {
+  // restart ke time jo "running" me atke the unhe wapas pending karo
+  StockSchedule.updateMany({ status: "running" }, { $set: { status: "pending" } }).catch(() => {});
+  setInterval(processStockSchedules, 30 * 1000);
+  processStockSchedules(); // server wapas on hone par miss hue schedules turant chalenge
+});
+
+// ---------- ADMIN: SCHEDULE BANAO ----------
+// Body: { items: [{ vpsId, category }], runAt: "ISO date string" }
+app.post("/api/admin/stock-schedules", protect, isAdmin, stockScheduleLimiter, async (req, res) => {
+  try {
+    const { items, runAt } = req.body;
+
+    if (!Array.isArray(items) || items.length === 0 || items.length > 50) {
+      return res.status(400).json({ message: "1 se 50 plans chuno." });
+    }
+    if (typeof runAt !== "string") {
+      return res.status(400).json({ message: "Time zaroori hai." });
+    }
+    const when = new Date(runAt);
+    if (isNaN(when.getTime())) {
+      return res.status(400).json({ message: "Time galat format me hai." });
+    }
+    const now = Date.now();
+    if (when.getTime() < now + 60 * 1000) {
+      return res.status(400).json({ message: "Time kam se kam 1 minute aage ka rakho." });
+    }
+    if (when.getTime() > now + 30 * 24 * 3600 * 1000) {
+      return res.status(400).json({ message: "Max 30 din aage tak schedule kar sakte ho." });
+    }
+
+    const created = [];
+    const skipped = [];
+    const seen = new Set();
+
+    for (const it of items) {
+      const vpsId = typeof it?.vpsId === "string" ? it.vpsId.trim() : "";
+      const cat = it?.category === "linux" ? "linux" : "vps";
+      if (!vpsId || vpsId.length > 100) continue;
+      const k = `${cat}:${vpsId}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+
+      const plan = await VpsPlan.findOne({ vpsId, category: cat }).select("nameOrIp");
+      if (!plan) { skipped.push({ vpsId, reason: "Plan nahi mila" }); continue; }
+
+      const poolCount = await StockItem.countDocuments({ vpsId, category: cat, status: "available" });
+      if (poolCount === 0) { skipped.push({ vpsId, reason: "Ready server nahi hai" }); continue; }
+
+      const dup = await StockSchedule.exists({ vpsId, category: cat, status: { $in: ["pending", "running"] } });
+      if (dup) { skipped.push({ vpsId, reason: "Pehle se schedule hai (pehle cancel karo)" }); continue; }
+
+      await StockSchedule.create({ vpsId, category: cat, runAt: when, createdBy: req.userId });
+      created.push(plan.nameOrIp || vpsId);
+    }
+
+    if (created.length) {
+      try {
+        sendTelegramMessage(
+          `⏰ <b>Stock Schedule Set</b>\n\n🕒 ${escapeHtml(when.toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }))}\n📦 ` +
+          created.map((n) => escapeHtml(n)).join(", ")
+        );
+      } catch (e) {}
+    }
+
+    res.status(201).json({
+      message: created.length ? `${created.length} plan schedule ho gaye.` : "Koi plan schedule nahi hua.",
+      created,
+      skipped,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ---------- ADMIN: SCHEDULES DEKHO ----------
+app.get("/api/admin/stock-schedules", protect, isAdmin, async (req, res) => {
+  try {
+    const rows = await StockSchedule.find({ status: { $ne: "cancelled" } })
+      .sort({ runAt: -1 })
+      .limit(60)
+      .lean();
+
+    const ids = [...new Set(rows.map((r) => r.vpsId))];
+    const plans = await VpsPlan.find({ vpsId: { $in: ids } }).select("vpsId category nameOrIp").lean();
+    const nameMap = {};
+    plans.forEach((p) => { nameMap[`${p.category}:${p.vpsId}`] = p.nameOrIp; });
+
+    res.json(rows.map((r) => ({ ...r, nameOrIp: nameMap[`${r.category}:${r.vpsId}`] || r.vpsId })));
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ---------- ADMIN: PENDING SCHEDULE CANCEL ----------
+app.delete("/api/admin/stock-schedules/:id", protect, isAdmin, stockScheduleLimiter, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ message: "Invalid id." });
+    }
+    const s = await StockSchedule.findOneAndUpdate(
+      { _id: req.params.id, status: "pending" },
+      { $set: { status: "cancelled", doneAt: new Date() } }
+    );
+    if (!s) return res.status(404).json({ message: "Schedule nahi mila ya pehle hi chal chuka hai." });
+    res.json({ message: "Schedule cancel ho gaya." });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+// ==================== END SCHEDULED STOCK ACTIVATION ====================
 
 // ==================== BASE ROUTE ====================
 
