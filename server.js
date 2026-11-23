@@ -287,6 +287,86 @@ async function pvOverview() {
   return data;
 }
 // ==================== END PRIMEVM CLIENT ====================
+// ==================== VIRTUALIZOR (SECUREDNSCLOUD) CLIENT ====================
+const VZ = {
+  base: (process.env.VIRTUALIZOR_BASE || "").replace(/\/$/, ""),
+  key: process.env.VIRTUALIZOR_API_KEY,
+  pass: process.env.VIRTUALIZOR_API_PASS,
+};
+const vzAgent = process.env.VIRTUALIZOR_INSECURE === "1" ? new https.Agent({ rejectUnauthorized: false }) : undefined;
+let vzChain = Promise.resolve();
+let vzOverviewCache = null;
+let vzOverviewTime = 0;
+
+// apikey/apipass URL me jaati hain, error message me leak na ho
+const vzClean = (s) =>
+  String(s || "").split(VZ.pass || "\u0000").join("***").split(VZ.key || "\u0000").join("***");
+
+async function vzDirect(act, params = {}, post = null) {
+  if (!VZ.base || !VZ.key || !VZ.pass) throw new Error("Virtualizor env vars set nahi hain.");
+  const qs = new URLSearchParams({ act, ...params, api: "json", apikey: VZ.key, apipass: VZ.pass });
+  let res, raw;
+  try {
+    res = await fetch(`${VZ.base}/index.php?${qs}`, {
+      method: post ? "POST" : "GET",
+      headers: post ? { "Content-Type": "application/x-www-form-urlencoded" } : {},
+      body: post ? new URLSearchParams(post).toString() : undefined,
+      agent: vzAgent,
+      timeout: 30000,
+    });
+    raw = await res.text();
+  } catch (e) {
+    throw new Error("Virtualizor connect error: " + vzClean(e.message));
+  }
+  let json;
+  try { json = JSON.parse(raw); }
+  catch (e) { throw new Error(`Virtualizor JSON nahi aaya (HTTP ${res.status}): ${vzClean(raw).slice(0, 150)}`); }
+  if (json.error) {
+    const er = typeof json.error === "string" ? json.error : Object.values(json.error).join(", ");
+    throw new Error("Virtualizor: " + vzClean(er));
+  }
+  return json;
+}
+
+// Requests ek-ek karke, beech me 500ms gap
+function vzApi(act, params, post) {
+  const run = vzChain.then(() => vzDirect(act, params, post));
+  vzChain = run.catch(() => {}).then(() => new Promise((r) => setTimeout(r, 500)));
+  return run;
+}
+
+async function vzOverview() {
+  const now = Date.now();
+  if (vzOverviewCache && now - vzOverviewTime < 20000) return vzOverviewCache;
+  const r = await vzApi("listvs");
+  const list = Object.entries(r.vs || {}).map(([k, v]) => ({
+    vmId: Number(v.vpsid || k),
+    running: Number(v.status) === 1,
+    ip: Object.values(v.ips || {})[0] || "",
+    os: v.os_name || "",
+    plan: v.hostname || "",
+    raw: v,
+  }));
+  vzOverviewCache = list;
+  vzOverviewTime = now;
+  return list;
+}
+
+// OS list ka structure alag ho sakta hai, isliye flatten karke [{id,name}] banate hain
+function vzFlattenOs(oslist) {
+  const out = [];
+  const walk = (node, key) => {
+    if (!node || typeof node !== "object") return;
+    if (typeof node.name === "string" && (node.osid != null || /^\d+$/.test(String(key)))) {
+      out.push({ id: Number(node.osid != null ? node.osid : key), name: node.name });
+      return;
+    }
+    for (const [k, v] of Object.entries(node)) walk(v, k);
+  };
+  walk(oslist, "");
+  return out;
+}
+// ==================== END VIRTUALIZOR CLIENT ====================
 
 const app = express();
 const isSafeVmPassword = (p) =>
@@ -404,6 +484,7 @@ async function securityAlert(type, req, userOrId, details = "", opts = {}) {
       `📱 <b>Mobile:</b> ${escapeHtml(u?.phone || "-")}`,
       `🎭 <b>Role:</b> ${escapeHtml(u?.role || "-")}`,
       `🌐 <b>IP:</b> <code>${escapeHtml(req?.ip || "-")}</code>`,
+            `🛰️ <b>Forwarded-For:</b> <code>${escapeHtml(String(req?.headers?.["x-forwarded-for"] || "-").slice(0, 120))}</code>`,
       `🔗 <b>Route:</b> ${escapeHtml(req ? `${req.method} ${req.originalUrl}`.slice(0, 150) : "-")}`,
       `🖥️ <b>Device:</b> ${escapeHtml(String(req?.headers?.["user-agent"] || "-").slice(0, 120))}`,
       `📝 <b>Detail:</b> ${escapeHtml(String(details).slice(0, 400))}`,
@@ -834,6 +915,7 @@ formatSeenByUser: { type: Boolean, default: true },
 vmId: { type: Number, default: null },
 mxVmId: { type: String, default: null },
 pvVmId: { type: Number, default: null },
+vzVmId: { type: Number, default: null },
 panelProvider: { type: String, enum: ["none", "oceanvps", "hosthell"], default: "none" },
 panelUsername: { type: String, default: "" },
 panelPasswordEnc: { type: String, default: "" },
@@ -2805,6 +2887,7 @@ app.post("/api/admin/orders/manual-create", protect, isAdmin, async (req, res) =
           deliveredAt, validityDays: days, expiresAt,
           vmId: vmId ? Number(vmId) : null,
           pvVmId: req.body.pvVmId ? Number(req.body.pvVmId) : null,
+          vzVmId: req.body.vzVmId ? Number(req.body.vzVmId) : null,
           ...buildPanelFields(req.body),
         }], { session });
 
@@ -2836,6 +2919,7 @@ app.post("/api/admin/orders/manual-create", protect, isAdmin, async (req, res) =
       deliveredAt, validityDays: days, expiresAt,
       vmId: vmId ? Number(vmId) : null,
       pvVmId: req.body.pvVmId ? Number(req.body.pvVmId) : null,
+      vzVmId: req.body.vzVmId ? Number(req.body.vzVmId) : null,
       ...buildPanelFields(req.body),
     });
 
@@ -3504,6 +3588,163 @@ app.put("/api/pv/admin/link/:orderId", protect, isAdmin, async (req, res) => {
   }
 });
 // ==================== END PRIMEVM ROUTES ====================
+// ==================== VIRTUALIZOR ROUTES ====================
+async function vzFindOwned(userId, vmId) {
+  const n = Number(vmId);
+  if (!n) return null;
+  return Order.findOne({ user: userId, vzVmId: n });
+}
+
+// ---- User: apne VMs ki live state ----
+app.get("/api/vz/my-vps", protect, async (req, res) => {
+  try {
+    const orders = await Order.find({ user: req.userId, vzVmId: { $ne: null } });
+    if (!orders.length) return res.json({ success: true, vms: [] });
+    const all = await vzOverview();
+    const ids = orders.map((o) => Number(o.vzVmId));
+    const vms = all
+      .filter((v) => ids.includes(v.vmId))
+      .map((v) => ({ vmId: v.vmId, liveState: v.running ? "running" : "stopped" }));
+    res.json({ success: true, vms });
+  } catch (err) {
+    res.json({ success: false, vms: [], message: err.message });
+  }
+});
+
+// ---- User: start / stop / reboot ----
+app.post("/api/vz/control", protect, guardVm(actionKey), async (req, res) => {
+  try {
+    const { vmId, action } = req.body;
+    if (!["start", "stop", "reboot"].includes(action)) {
+      return res.status(400).json({ success: false, message: "Invalid action." });
+    }
+    const order = await vzFindOwned(req.userId, vmId);
+    if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
+    const act = action === "reboot" ? "restart" : action;
+    const r = await vzApi(act, { svs: Number(vmId), do: 1 });
+    if (!r.done) return res.json({ success: false, message: "Action nahi hua." });
+    vzOverviewCache = null;
+    res.json({ success: true, data: { message: r.done.msg || "ok" } });
+  } catch (err) {
+    res.json({ success: false, message: err.message });
+  }
+});
+
+// ---- User: password change ----
+app.post("/api/vz/change-password", protect, guardVm("password"), async (req, res) => {
+  try {
+    const { vmId, newPassword } = req.body;
+    if (!isSafeVmPassword(newPassword)) {
+      return res.json({ success: false, message: "Password 8-72 characters ka ho, aur space ya < > \" ' ` \\ & use na karo." });
+    }
+    const order = await vzFindOwned(req.userId, vmId);
+    if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
+    const r = await vzApi(
+      "changepassword",
+      { svs: Number(vmId), do: 1 },
+      { changepass: 1, newpass: newPassword, conf: newPassword }
+    );
+    if (!r.done) return res.json({ success: false, message: "Password change nahi hua." });
+    order.deliveryPassword = newPassword;
+    await order.save();
+    res.json({ success: true, data: { message: r.done.msg || "Password changed" } });
+  } catch (err) {
+    res.json({ success: false, message: err.message });
+  }
+});
+
+// ---- User: OS list (rebuild ke liye) ----
+app.get("/api/vz/isos/:vmId", protect, async (req, res) => {
+  try {
+    const order = await vzFindOwned(req.userId, req.params.vmId);
+    if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
+    const r = await vzApi("ostemplate", { svs: Number(req.params.vmId) });
+    res.json({ success: true, isos: vzFlattenOs(r.oslist) });
+  } catch (err) {
+    res.json({ success: false, isos: [], message: err.message });
+  }
+});
+
+// ---- User: rebuild ----
+const vzRebuildInProgress = new Set();
+app.post("/api/vz/rebuild", protect, guardVm("rebuild"), async (req, res) => {
+  const { vmId, isoId } = req.body;
+  const lockKey = String(vmId);
+  try {
+    const order = await vzFindOwned(req.userId, vmId);
+    if (!order) return res.status(403).json({ success: false, message: "Ye VM aapka nahi hai." });
+    if (vzRebuildInProgress.has(lockKey)) {
+      return res.json({ success: false, message: "Rebuild already chal rahi hai, thodi der wait karo." });
+    }
+    vzRebuildInProgress.add(lockKey);
+
+    const r0 = await vzApi("ostemplate", { svs: Number(vmId) });
+    const validOs = vzFlattenOs(r0.oslist).find((o) => o.id === Number(isoId));
+    if (!validOs) {
+      vzRebuildInProgress.delete(lockKey);
+      return res.json({ success: false, message: "Selected OS valid nahi hai." });
+    }
+
+    const newPassword = crypto.randomBytes(9).toString("base64").replace(/[+/=]/g, "x") + "!9a";
+    const r = await vzApi(
+      "ostemplate",
+      { svs: Number(vmId) },
+      { reinsos: 1, newos: validOs.id, newpass: newPassword, conf: newPassword, vid: Number(vmId) }
+    );
+    if (!r.done) {
+      vzRebuildInProgress.delete(lockKey);
+      return res.json({ success: false, message: "Rebuild shuru nahi hua." });
+    }
+
+    order.deliveryPassword = newPassword;
+    order.deliveryOS = validOs.name;
+    await order.save();
+    vzOverviewCache = null;
+
+    setTimeout(() => vzRebuildInProgress.delete(lockKey), 3 * 60 * 1000);
+    res.json({ success: true, data: { message: "Rebuild initiated." } });
+  } catch (err) {
+    vzRebuildInProgress.delete(lockKey);
+    res.json({ success: false, message: err.message });
+  }
+});
+
+// ---- Admin: panel ke saare VMs (Find VM ke liye) ----
+app.get("/api/vz/admin/live-vms", protect, isAdmin, async (req, res) => {
+  try {
+    const all = await vzOverview();
+    res.json({
+      success: true,
+      vms: all.map((v) => ({ vmId: v.vmId, ip: v.ip, os: v.os, plan: v.plan, status: v.running ? "running" : "stopped" })),
+    });
+  } catch (err) {
+    res.json({ success: false, message: err.message });
+  }
+});
+
+// ---- Admin: connection test (sample me panel ka asli response dikhega) ----
+app.get("/api/vz/admin/test", protect, isAdmin, async (req, res) => {
+  try {
+    const all = await vzOverview();
+    res.json({ success: true, vmCount: all.length, sample: all[0] ? all[0].raw : null });
+  } catch (err) {
+    res.json({ success: false, message: err.message });
+  }
+});
+
+// ---- Admin: order ko VM se jodo ----
+app.put("/api/vz/admin/link/:orderId", protect, isAdmin, async (req, res) => {
+  try {
+    const vzVmId = Number(req.body.vzVmId);
+    if (!vzVmId) return res.status(400).json({ message: "vzVmId zaroori hai." });
+    const order = await Order.findByIdAndUpdate(req.params.orderId, { vzVmId }, { new: true });
+    if (!order) return res.status(404).json({ message: "Order nahi mila." });
+    res.json({ message: "Virtualizor VM link ho gaya.", order });
+  } catch (err) {
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+// ==================== END VIRTUALIZOR ROUTES ====================
 // ==================== NETWORK REPAIR (NAYA) ====================
 // Ye route VM ka network dobara configure karta hai. Dhyan: VM reboot hota hai.
 // Abuse na ho isliye har VM par 5 minute ka cooldown hai.
@@ -4245,6 +4486,7 @@ app.put("/api/admin/orders/:id", protect, isAdmin, async (req, res) => {
     const updateFields = {};
     if (req.body.vmId !== undefined) updateFields.vmId = Number(req.body.vmId) || null;
     if (req.body.pvVmId !== undefined) updateFields.pvVmId = Number(req.body.pvVmId) || null;
+    if (req.body.vzVmId !== undefined) updateFields.vzVmId = Number(req.body.vzVmId) || null;
     if (req.body.mxVmId !== undefined) updateFields.mxVmId = String(req.body.mxVmId || "").trim() || null;
     if (req.body.panelProvider !== undefined) {
   Object.assign(updateFields, buildPanelFields(req.body, true));
