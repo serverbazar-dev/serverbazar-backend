@@ -934,6 +934,102 @@ pwSetProvider: { type: String, enum: ["hh", "pv", ""], default: "" },
   },
   { timestamps: true }
 );
+// ==================== PURCHASE RECORD (HISTORY KI ALAG COPY) ====================
+// Order delete ho jaye tab bhi ye record bacha rehta hai.
+const purchaseRecordSchema = new mongoose.Schema(
+  {
+    orderId: { type: mongoose.Schema.Types.ObjectId, required: true, unique: true },
+    user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+    purchasedAt: { type: Date },
+    category: { type: String, default: "vps" },
+    nameOrIp: String,
+    planName: String,
+    ram: String,
+    deliveryIp: { type: String, default: "" },
+    price: Number,
+    finalAmount: Number,
+    status: String,
+    expiresAt: { type: Date, default: null },
+    paymentGateway: String,
+    couponCode: { type: String, default: "" },
+    orderDeleted: { type: Boolean, default: false },
+    deletedAt: { type: Date },
+  },
+  { timestamps: true }
+);
+const PurchaseRecord = mongoose.model("PurchaseRecord", purchaseRecordSchema);
+
+function purchaseRecordFields(o) {
+  return {
+    user: o.user,
+    purchasedAt: o.createdAt,
+    category: o.category,
+    nameOrIp: o.nameOrIp,
+    planName: o.planName,
+    ram: o.ram,
+    deliveryIp: o.deliveryIp || "",
+    price: o.price,
+    finalAmount: o.finalAmount,
+    status: o.status,
+    expiresAt: o.expiresAt || null,
+    paymentGateway: o.paymentGateway,
+    couponCode: o.couponCode || "",
+  };
+}
+
+// Order ko DB se padh kar record update karta hai (order na mile to kuch nahi karta)
+async function syncPurchaseRecord(orderId) {
+  try {
+    const o = await Order.findById(orderId).lean();
+    if (!o) return;
+    await PurchaseRecord.updateOne(
+      { orderId: o._id },
+      { $set: purchaseRecordFields(o) },
+      { upsert: true }
+    );
+  } catch (e) {
+    console.error("syncPurchaseRecord error:", e.message);
+  }
+}
+
+// Order banne / badalne par record apne aap update hota hai
+orderSchema.post("save", function (doc) {
+  setTimeout(() => syncPurchaseRecord(doc._id), 1500);
+});
+orderSchema.post("findOneAndUpdate", function (doc) {
+  if (doc) setTimeout(() => syncPurchaseRecord(doc._id), 500);
+});
+// Admin order delete kare to record DELETE NAHI hota, sirf "removed" mark hota hai
+orderSchema.post("findOneAndDelete", function (doc) {
+  if (doc) {
+    PurchaseRecord.updateOne(
+      { orderId: doc._id },
+      { $set: { orderDeleted: true, deletedAt: new Date() } }
+    ).catch(() => {});
+  }
+});
+
+// Server start par jo purane orders abhi tak record me nahi hain, unko add karo
+mongoose.connection.once("open", async () => {
+  try {
+    const orders = await Order.find().lean();
+    if (!orders.length) return;
+    await PurchaseRecord.bulkWrite(
+      orders.map((o) => ({
+        updateOne: {
+          filter: { orderId: o._id },
+          update: { $setOnInsert: purchaseRecordFields(o) },
+          upsert: true,
+        },
+      })),
+      { ordered: false }
+    );
+    console.log("PurchaseRecord backfill done ✅");
+  } catch (e) {
+    console.error("PurchaseRecord backfill error:", e.message);
+  }
+});
+// ==================== END PURCHASE RECORD ====================
 const Order = mongoose.model("Order", orderSchema);
 // ==================== REBUILD PASSWORD AUTO-SET ====================
 // Sirf letters + numbers (HostHeaven special character accept nahi karta)
@@ -2664,6 +2760,106 @@ res.json(orders.map((o) => ({ ...serializeOrderForUser(o), renewalPending: pendS
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
+// ==================== PURCHASE HISTORY (NAYA) ====================
+const RENEWAL_HISTORY_FIELDS =
+  "createdAt category nameOrIp ram deliveryIp price status newExpiresAt paymentGateway couponCode";
+
+function historyStatus(rec) {
+  if (rec.orderDeleted) return "removed";
+  if (["delivered", "active"].includes(rec.status) && rec.expiresAt && new Date(rec.expiresAt) < new Date()) {
+    return "expired";
+  }
+  return rec.status;
+}
+
+function buildHistoryRows(records, renewals) {
+  const rows = [];
+  records.forEach((o) => rows.push({
+    id: o.orderId,
+    type: "purchase",
+    date: o.purchasedAt,
+    category: o.category,
+    plan: o.nameOrIp || o.planName || "-",
+    ram: o.ram || "-",
+    ip: o.deliveryIp || "",
+    amount: o.finalAmount != null ? o.finalAmount : o.price,
+    status: historyStatus(o),
+    expiresAt: o.expiresAt || null,
+    gateway: o.paymentGateway || "",
+    coupon: o.couponCode || "",
+  }));
+  renewals.forEach((r) => rows.push({
+    id: r._id,
+    type: "renewal",
+    date: r.createdAt,
+    category: r.category,
+    plan: r.nameOrIp || "-",
+    ram: r.ram || "-",
+    ip: r.deliveryIp || "",
+    amount: r.price,
+    status: r.status === "done" ? "renewed" : "renewal pending",
+    expiresAt: r.newExpiresAt || null,
+    gateway: r.paymentGateway || "",
+    coupon: r.couponCode || "",
+  }));
+  rows.sort((a, b) => new Date(b.date) - new Date(a.date));
+  return rows;
+}
+
+// USER: apni purchase history (password kabhi nahi bhejte)
+app.get("/api/vps/purchase-history", protect, async (req, res) => {
+  try {
+    const [records, renewals] = await Promise.all([
+      PurchaseRecord.find({ user: req.userId }).sort({ purchasedAt: -1 }).lean(),
+      Renewal.find({ user: req.userId, status: { $ne: "cancelled" } })
+        .select(RENEWAL_HISTORY_FIELDS).sort({ createdAt: -1 }).lean(),
+    ]);
+    res.json({ rows: buildHistoryRows(records, renewals) });
+  } catch (err) {
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// ADMIN: users ki list (naam + email), search ke saath
+app.get("/api/admin/purchase-history-users", protect, isAdmin, async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim().slice(0, 100);
+    const filter = {};
+    if (q) {
+      const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [{ email: rx }, { name: rx }];
+    }
+    const users = await User.find(filter).select("name email phone").sort({ name: 1 }).limit(200).lean();
+    const counts = await PurchaseRecord.aggregate([
+      { $match: { user: { $in: users.map((u) => u._id) } } },
+      { $group: { _id: "$user", n: { $sum: 1 } } },
+    ]);
+    const cMap = {};
+    counts.forEach((c) => { cMap[String(c._id)] = c.n; });
+    res.json(users.map((u) => ({ ...u, orderCount: cMap[String(u._id)] || 0 })));
+  } catch (err) {
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// ADMIN: ek user ki poori history
+app.get("/api/admin/purchase-history/:userId", protect, isAdmin, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.userId))
+      return res.status(400).json({ message: "Invalid user." });
+    const user = await User.findById(req.params.userId).select("name email phone").lean();
+    if (!user) return res.status(404).json({ message: "User nahi mila." });
+    const [records, renewals] = await Promise.all([
+      PurchaseRecord.find({ user: user._id }).sort({ purchasedAt: -1 }).lean(),
+      Renewal.find({ user: user._id, status: { $ne: "cancelled" } })
+        .select(RENEWAL_HISTORY_FIELDS).sort({ createdAt: -1 }).lean(),
+    ]);
+    res.json({ user, rows: buildHistoryRows(records, renewals) });
+  } catch (err) {
+    res.status(500).json({ message: "Server error" });
+  }
+});
+// ==================== END PURCHASE HISTORY ====================
 // ==================== RENEWAL ROUTES ====================
 app.post("/api/vps/renew/validate-coupon", couponLimiter, protect, async (req, res) => {
   try {
