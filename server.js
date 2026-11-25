@@ -5966,12 +5966,18 @@ async function runScheduledActivation(s) {
   const fresh = await VpsPlan.findById(plan._id).select("nameOrIp stockQty");
   return { ok: true, msg: `In stock ho gaya. Stock: ${fresh.stockQty}`, name: fresh.nameOrIp };
 }
-
+const SCHEDULE_KEEP_MS = 60 * 60 * 1000; // done hone ke 1 ghante baad delete
 let stockSchedTickRunning = false;
 async function processStockSchedules() {
   if (stockSchedTickRunning || mongoose.connection.readyState !== 1) return;
   stockSchedTickRunning = true;
   try {
+    // jo schedule 1 ghante se pehle khatam ho chuke hain, unko delete karo
+    await StockSchedule.deleteMany({
+      status: { $in: ["done", "failed", "cancelled"] },
+      doneAt: { $lte: new Date(Date.now() - SCHEDULE_KEEP_MS) },
+    });
+
     for (let i = 0; i < 50; i++) {
       // atomic claim: ek schedule sirf ek baar chalega
       const s = await StockSchedule.findOneAndUpdate(
@@ -6010,6 +6016,43 @@ mongoose.connection.once("open", () => {
   setInterval(processStockSchedules, 30 * 1000);
   processStockSchedules(); // server wapas on hone par miss hue schedules turant chalenge
 });
+// ---------- EXACT TIME TIMER ----------
+const armedTimes = new Set();
+
+function runAtExactTime() {
+  // pehle se koi run chal raha ho to aadha second baad dobara try karo
+  if (stockSchedTickRunning) return setTimeout(runAtExactTime, 500);
+  processStockSchedules();
+}
+
+async function armUpcomingSchedules() {
+  if (mongoose.connection.readyState !== 1) return;
+  try {
+    // agle 1 minute me jo schedule due hain
+    const rows = await StockSchedule.find({
+      status: "pending",
+      runAt: { $gt: new Date(), $lte: new Date(Date.now() + 60 * 1000) },
+    }).select("runAt").lean();
+
+    rows.forEach((r) => {
+      const t = new Date(r.runAt).getTime();
+      if (armedTimes.has(t)) return; // is time ka timer pehle se laga hai
+      armedTimes.add(t);
+      setTimeout(() => {
+        armedTimes.delete(t);
+        runAtExactTime();
+      }, Math.max(0, t - Date.now()) + 50);
+    });
+  } catch (err) {
+    console.error("armUpcomingSchedules error:", err.message);
+  }
+}
+
+mongoose.connection.once("open", () => {
+  armUpcomingSchedules();
+  setInterval(armUpcomingSchedules, 20 * 1000);
+});
+// ---------- END EXACT TIME TIMER ----------
 
 // ---------- ADMIN: SCHEDULE BANAO ----------
 // Body: { items: [{ vpsId, category }], runAt: "ISO date string" }
@@ -6082,7 +6125,15 @@ app.post("/api/admin/stock-schedules", protect, isAdmin, stockScheduleLimiter, a
 // ---------- ADMIN: SCHEDULES DEKHO ----------
 app.get("/api/admin/stock-schedules", protect, isAdmin, async (req, res) => {
   try {
-    const rows = await StockSchedule.find({ status: { $ne: "cancelled" } })
+    const rows = await StockSchedule.find({
+      $or: [
+        { status: { $in: ["pending", "running"] } },
+        {
+          status: { $in: ["done", "failed"] },
+          doneAt: { $gt: new Date(Date.now() - SCHEDULE_KEEP_MS) },
+        },
+      ],
+    })
       .sort({ runAt: -1 })
       .limit(60)
       .lean();
