@@ -1337,7 +1337,7 @@ function logPurchaseActivity(data) {
   );
 }
 // ==================== STOCK HOLD ====================
-const HOLD_SECONDS = 180; // 3 minute
+const HOLD_SECONDS = 300; // 3 minute
 const stockHoldSchema = new mongoose.Schema(
   {
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
@@ -1839,7 +1839,7 @@ function cleanVpsDiscounts(input) {
 }
 async function countCouponUsage(userId, code) {
   const [fromOrders, fromRenewals] = await Promise.all([
-    Order.countDocuments({ user: userId, couponCode: code }),
+    Order.countDocuments({ user: userId, couponCode: code, paymentStatus: { $ne: "refunded" } }),
     Renewal.countDocuments({ user: userId, couponCode: code, status: { $ne: "cancelled" } }),
   ]);
   return fromOrders + fromRenewals;
@@ -2440,7 +2440,13 @@ if (blockMsg) return res.status(423).json({ message: blockMsg, gatewayLocked: tr
         logPurchaseActivity({ user: req.userId, category: cat, vpsId: plan.vpsId, nameOrIp: plan.nameOrIp, ram: selectedOption.ram, gateway: "wallet", stage: "create-payment", status: "success", message: "Order confirm ✅", amount: finalAmount });
 
         const finalOrder = await deliverAndAlert(order);
-        return res.status(201).json({ gateway: "wallet", message: "Wallet se payment ho gaya! Order confirm.", order: finalOrder });
+        return res.status(201).json({
+  gateway: "wallet",
+  message: finalOrder && finalOrder.status === "cancelled"
+    ? "Stock khatam ho gaya tha, isliye aapka paisa wallet me refund kar diya gaya."
+    : "Wallet se payment ho gaya! Order confirm.",
+  order: finalOrder,
+});
       } catch (err) {
         await session.abortTransaction();
         session.endSession();
@@ -2566,7 +2572,12 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
     // Pending record dhundo jo humne create-payment step me banaya tha
     const pending = await PendingPayment.findOne({ razorpayOrderId: razorpay_order_id, user: req.userId });
     if (!pending) {
-            securityAlert("payment_record_not_found_or_replay", req, req.userId, `Razorpay order: ${razorpay_order_id}`, { key: String(req.userId) });
+      const alreadyDone =
+        (await Order.exists({ razorpayOrderId: razorpay_order_id, user: req.userId })) ||
+        (await Renewal.exists({ razorpayOrderId: razorpay_order_id, user: req.userId }));
+      if (!alreadyDone) {
+        securityAlert("payment_record_not_found_or_replay", req, req.userId, `Razorpay order: ${razorpay_order_id}`, { key: String(req.userId) });
+      }
       return res.status(404).json({ message: "Payment record nahi mila ya already process ho chuka hai." });
     }
 
@@ -2645,7 +2656,12 @@ app.post("/api/vps/verify-payment", protect, async (req, res) => {
 
 
     const finalOrder = await deliverAndAlert(order);
-    res.status(201).json({ message: "Payment successful! Order confirm ho gaya.", order: finalOrder });
+    res.status(201).json({
+  message: finalOrder && finalOrder.status === "cancelled"
+    ? "Stock khatam ho gaya tha, isliye aapka paisa wallet me refund kar diya gaya."
+    : "Payment successful! Order confirm ho gaya.",
+  order: finalOrder,
+});
   } catch (err) {
     res.status(500).json({ message: "Payment verify karte waqt error", error: err.message });
   }
@@ -2667,7 +2683,12 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
 
     const pending = await PendingPayment.findOne({ cfOrderId: orderId, user: req.userId });
     if (!pending) {
-            securityAlert("payment_record_not_found_or_replay", req, req.userId, `Cashfree orderId: ${orderId}`, { key: String(req.userId) });
+      const alreadyDone =
+        (await Order.exists({ cfOrderId: orderId, user: req.userId })) ||
+        (await Renewal.exists({ cfOrderId: orderId, user: req.userId }));
+      if (!alreadyDone) {
+        securityAlert("payment_record_not_found_or_replay", req, req.userId, `Cashfree orderId: ${orderId}`, { key: String(req.userId) });
+      }
       return res.status(404).json({ message: "Payment record nahi mila ya already process ho chuka hai." });
     }
 
@@ -2738,7 +2759,12 @@ app.post("/api/vps/verify-payment-cashfree", protect, async (req, res) => {
     
    
     const finalOrder = await deliverAndAlert(order);
-    res.status(201).json({ message: "Payment successful! Order confirm ho gaya.", order: finalOrder });
+    res.status(201).json({
+      message: finalOrder && finalOrder.status === "cancelled"
+        ? "Stock khatam ho gaya tha, isliye aapka paisa wallet me refund kar diya gaya."
+        : "Payment successful! Order confirm ho gaya.",
+      order: finalOrder,
+    });
   } catch (err) {
     res.status(500).json({ message: "Payment verify karte waqt error", error: err.message });
   }
@@ -5567,6 +5593,65 @@ async function syncPlanStockFromPool(vpsId, category) {
     }
   });
 }
+// ==================== OVERSELL GUARD (NAYA) ====================
+// Order ke liye sach me koi server/stock bacha tha ya nahi
+async function isOversold(order) {
+  const { vpsId, category, ram } = order;
+  if (!vpsId || String(vpsId).startsWith("manual_")) return false;
+
+  // Is order ko already koi server mil chuka hai to oversold nahi
+  if (await StockItem.exists({ orderId: order._id })) return false;
+
+  // Sirf ready-stock (pool) wale plans me check hoga
+  const hasPool = await StockItem.exists({ vpsId, category });
+  if (!hasPool) return false;
+
+  const avail = await StockItem.countDocuments({ vpsId, category, ram, status: "available" });
+  return avail === 0;
+}
+
+// Oversold order ko cancel karke pura paisa wallet me wapas
+async function refundOversoldOrder(order) {
+  // atomic: ek hi baar refund hoga, double refund nahi
+  const upd = await Order.findOneAndUpdate(
+    { _id: order._id, status: "pending", deliveryIp: { $in: [null, ""] } },
+    { $set: { status: "cancelled", paymentStatus: "refunded" } },
+    { new: true }
+  );
+  if (!upd) return null;
+
+  const amt = Number(upd.finalAmount != null ? upd.finalAmount : upd.price) || 0;
+  if (amt > 0) {
+    await Wallet.findOneAndUpdate(
+      { user: upd.user },
+      { $inc: { balance: amt } },
+      { upsert: true }
+    );
+    await WalletTransaction.create({
+      user: upd.user,
+      type: "refund",
+      amount: amt,
+      description: `Auto refund: stock khatam ho gaya (${upd.nameOrIp || upd.planName})`,
+      orderId: upd._id,
+      status: "completed",
+    });
+  }
+
+  // coupon use wapas
+  if (upd.couponCode) {
+    await Coupon.updateOne({ code: upd.couponCode }, { $inc: { usedCount: -1 } }).catch(() => {});
+  }
+
+  try {
+    const u = await User.findById(upd.user).select("name email");
+    sendTelegramMessage(
+      `⚠️ <b>Oversell Roka Gaya</b>\n\n👤 ${escapeHtml(u?.name)} (${escapeHtml(u?.email)})\n📦 ${escapeHtml(upd.nameOrIp)} · ${escapeHtml(upd.ram || "-")}\n💰 ₹${amt} wallet me refund kar diya\n🆔 <code>${escapeHtml(upd._id)}</code>`
+    );
+  } catch (e) {}
+
+  return upd;
+}
+// ==================== END OVERSELL GUARD ====================
 // Order ke baad sirf ek alert bhejta hai:
 // deliver ho gaya to "Auto Delivered Order" (autoDeliverOrder khud bhejta hai),
 // nahi hua (stock nahi mila) to "Naya Order Mila"
@@ -5574,12 +5659,22 @@ async function deliverAndAlert(order) {
   const finalOrder = await autoDeliverOrder(order);
   try {
     if (!(finalOrder && finalOrder.status === "delivered")) {
-      // pool me server nahi mila, yaani ye order manual se dena hai:
-      // manual stock me se ek ghatao
-      await VpsPlan.updateOne(
+      // pool me server nahi mila: pehle manual stock se ghatane ki koshish
+      const manualDec = await VpsPlan.updateOne(
         { vpsId: order.vpsId, category: order.category, manualStockQty: { $gt: 0 } },
         { $inc: { manualStockQty: -1 } }
       );
+      const usedManual = (manualDec.modifiedCount ?? manualDec.nModified ?? 0) > 0;
+
+      // NAYA: manual stock bhi nahi tha aur pool bhi khaali = oversell, refund karo
+      if (!usedManual && (await isOversold(order))) {
+        const cancelled = await refundOversoldOrder(order);
+        if (cancelled) {
+          await syncPlanStockFromPool(order.vpsId, order.category);
+          return cancelled;
+        }
+      }
+
       await syncPlanStockFromPool(order.vpsId, order.category);
 
       const u = await User.findById(order.user).select("name email");
