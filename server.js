@@ -1030,6 +1030,14 @@ mongoose.connection.once("open", async () => {
   }
 });
 // ==================== END PURCHASE RECORD ====================
+orderSchema.index(
+  { razorpayPaymentId: 1 },
+  { unique: true, partialFilterExpression: { razorpayPaymentId: { $type: "string" } } }
+);
+orderSchema.index(
+  { cfOrderId: 1 },
+  { unique: true, partialFilterExpression: { cfOrderId: { $type: "string" } } }
+);
 const Order = mongoose.model("Order", orderSchema);
 // ==================== REBUILD PASSWORD AUTO-SET ====================
 // Sirf letters + numbers (HostHeaven special character accept nahi karta)
@@ -1276,8 +1284,8 @@ const walletTransactionSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
-const WalletTransaction = mongoose.model("WalletTransaction", walletTransactionSchema);
 walletTransactionSchema.index({ razorpayPaymentId: 1 }, { unique: true, sparse: true });
+const WalletTransaction = mongoose.model("WalletTransaction", walletTransactionSchema);
 const proxyServerSchema = new mongoose.Schema(
   {
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
@@ -4515,7 +4523,8 @@ if (blockMsg) return res.status(423).json({ message: blockMsg, gatewayLocked: tr
     const razorpayOrder = await razorpay.orders.create({
       amount: Math.round(amt * 100),
       currency: "INR",
-      receipt: `wallet_${req.userId}_${Date.now()}`,
+      receipt: `w_${Date.now()}`,
+      notes: { type: "wallet_recharge", userId: String(req.userId) },
     });
 
     res.json({
@@ -4547,6 +4556,15 @@ app.post("/api/wallet/verify-recharge", protect, async (req, res) => {
     if (expectedSignature !== razorpay_signature) {
             securityAlert("FAKE_WALLET_RECHARGE_signature", req, req.userId, `order: ${razorpay_order_id}, payment: ${razorpay_payment_id}`, { key: String(req.userId) });
       return res.status(400).json({ message: "Signature match nahi hui." });
+    }
+        // Check karo ki ye order isi user ke wallet recharge ka hai
+    const rzOrder = await razorpay.orders.fetch(razorpay_order_id);
+    if (
+      rzOrder.notes?.type !== "wallet_recharge" ||
+      rzOrder.notes?.userId !== String(req.userId)
+    ) {
+      securityAlert("FAKE_WALLET_RECHARGE_wrong_order", req, req.userId, `order: ${razorpay_order_id}`);
+      return res.status(400).json({ message: "Ye wallet recharge ka order nahi hai." });
     }
 
     // Isi payment ID se pehle koi transaction already ban chuka to duplicate credit rok do
