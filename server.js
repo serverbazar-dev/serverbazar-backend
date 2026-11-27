@@ -1515,6 +1515,126 @@ app.put("/api/admin/vm-controls", protect, isAdmin, async (req, res) => {
   }
 });
 // ==================== END VM CONTROL LOCK ====================
+// ==================== VM AUTO LOCK (DAILY SCHEDULE) ====================
+// Roz IST time par VM controls lock aur unlock karta hai
+function parseHHMM(value, fallback) {
+  const re = /^([01]?\d|2[0-3]):([0-5]\d)$/;
+  const m = re.exec(String(value || "").trim()) || re.exec(fallback);
+  return {
+    mins: Number(m[1]) * 60 + Number(m[2]),
+    label: `${m[1].padStart(2, "0")}:${m[2]}`,
+  };
+}
+
+const VM_AUTO_ENABLED = String(process.env.VM_AUTO_LOCK || "on").toLowerCase() !== "off";
+const VM_AUTO_START = parseHHMM(process.env.VM_AUTO_LOCK_START, "09:00");
+const VM_AUTO_END = parseHHMM(process.env.VM_AUTO_LOCK_END, "11:15");
+
+// Lock ke time users ko ye message dikhega
+const VM_AUTO_NOTICE = `VM controls abhi band hain. ${VM_AUTO_END.label} (IST) ke baad chalu honge.`;
+
+const vmAutoLockSchema = new mongoose.Schema(
+  {
+    key: { type: String, default: "daily", unique: true },
+    active: { type: Boolean, default: false },      // abhi auto lock laga hua hai?
+    lastRun: { type: String, default: "" },         // ek din me ek hi baar lock
+    prevDisabled: { type: mongoose.Schema.Types.Mixed, default: {} }, // lock se pehle ki setting
+    prevNotice: { type: String, default: "" },
+  },
+  { timestamps: true }
+);
+const VmAutoLock = mongoose.model("VmAutoLock", vmAutoLockSchema);
+
+// Server kisi bhi country me ho, time hamesha India ka lega
+function getIstNow() {
+  const ist = new Date(Date.now() + 330 * 60 * 1000); // UTC + 5:30
+  return {
+    date: ist.toISOString().slice(0, 10),
+    mins: ist.getUTCHours() * 60 + ist.getUTCMinutes(),
+  };
+}
+
+let vmAutoRunning = false;
+async function runVmAutoLock() {
+  if (vmAutoRunning || mongoose.connection.readyState !== 1) return;
+  vmAutoRunning = true;
+  try {
+    const now = getIstNow();
+    const inWindow =
+      VM_AUTO_ENABLED && now.mins >= VM_AUTO_START.mins && now.mins < VM_AUTO_END.mins;
+    const runId = `${now.date} ${VM_AUTO_START.label}-${VM_AUTO_END.label}`;
+
+    const state = (await VmAutoLock.findOne({ key: "daily" })) || new VmAutoLock({ key: "daily" });
+    const timeText = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
+
+    if (inWindow && state.lastRun !== runId) {
+      // ---------- LOCK ----------
+      // Pehle purani setting save karo, taaki baad me wapas la sakein
+      if (!state.active) {
+        const current = await getVmControlSettings();
+        state.prevDisabled = current.disabled;
+        state.prevNotice = current.notice;
+        state.active = true;
+        await state.save();
+      }
+
+      const disabled = {};
+      VM_CONTROL_KEYS.forEach((k) => { disabled[k] = true; });
+
+      await VmControlSetting.findOneAndUpdate(
+        { key: "vm_controls" },
+        { disabled, notice: VM_AUTO_NOTICE },
+        { upsert: true }
+      );
+
+      state.lastRun = runId;
+      await state.save();
+
+      console.log("VM auto lock ON 🔒");
+      sendTelegramMessage(
+        `🔒 <b>VM Controls Auto LOCK</b>\n\nBand: ${VM_CONTROL_KEYS.join(", ")}\n⏰ Auto unlock: ${VM_AUTO_END.label} IST\n🕒 ${escapeHtml(timeText)}`
+      );
+    } else if (!inWindow && state.active) {
+      // ---------- UNLOCK (lock se pehle wali setting wapas) ----------
+      const disabled = {};
+      VM_CONTROL_KEYS.forEach((k) => {
+        disabled[k] = !!(state.prevDisabled && state.prevDisabled[k]);
+      });
+
+      await VmControlSetting.findOneAndUpdate(
+        { key: "vm_controls" },
+        { disabled, notice: state.prevNotice || "" },
+        { upsert: true }
+      );
+
+      state.active = false;
+      await state.save();
+
+      const stillOff = VM_CONTROL_KEYS.filter((k) => disabled[k]);
+      console.log("VM auto lock OFF 🔓");
+      sendTelegramMessage(
+        `🔓 <b>VM Controls Auto UNLOCK</b>\n\n${
+          stillOff.length
+            ? `Ye pehle se manual band the, isliye band hi hain: ${stillOff.join(", ")}`
+            : "✅ Sab controls chalu ho gaye."
+        }\n🕒 ${escapeHtml(timeText)}`
+      );
+    }
+  } catch (err) {
+    console.error("runVmAutoLock error:", err.message);
+  } finally {
+    vmAutoRunning = false;
+  }
+}
+
+mongoose.connection.once("open", () => {
+  console.log(
+    `VM auto lock: ${VM_AUTO_ENABLED ? "ON" : "OFF"} (${VM_AUTO_START.label} - ${VM_AUTO_END.label} IST)`
+  );
+  runVmAutoLock();
+  setInterval(runVmAutoLock, 20 * 1000); // har 20 second me check
+});
+// ==================== END VM AUTO LOCK ====================
 // ==================== PAYMENT GATEWAY LOCK ====================
 const GATEWAY_KEYS = ["razorpay", "cashfree"];
 
